@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gaekju-types",
+    "crates/gaekju-indexer",
+    "crates/gaekju-api",
+    "crates/gaekju-keeper",
+    "crates/gaekju-sdk",
+    "crates/gaekju-cli",
+    "crates/gaekju-mirror",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+alloy = { version = "0.12", features = ["full"] }
+alloy-sol-types = "0.8"
+alloy-primitives = { version = "0.8", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+eyre = "0.6"
