@@ -1,0 +1,120 @@
+openapi: 3.0.3
+info:
+  title: Gaekju API
+  description: REST API for the Gaekju perpetual futures DEX on Giwa Chain.
+  version: 0.1.0
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8080/v1
+    description: Local development
+  - url: https://api.gaekju.xyz/v1
+    description: Testnet
+
+paths:
+  /markets:
+    get:
+      summary: List all markets
+      tags: [Markets]
+      responses:
+        '200':
+          description: Array of market info objects
+
+  /markets/{id}:
+    get:
+      summary: Get single market info
+      tags: [Markets]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+
+  /markets/{id}/orderbook:
+    get:
+      summary: Orderbook snapshot
+      tags: [Markets]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            default: 20
+
+  /markets/{id}/trades:
+    get:
+      summary: Recent trades
+      tags: [Markets]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+
+  /markets/{id}/funding:
+    get:
+      summary: Funding rate history
+      tags: [Markets]
+
+  /markets/{id}/stats:
+    get:
+      summary: 24h market statistics
+      tags: [Markets]
+
+  /account/{address}:
+    get:
+      summary: Account overview
+      tags: [Account]
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+
+  /account/{address}/positions:
+    get:
+      summary: Open positions
+      tags: [Account]
+
+  /account/{address}/orders:
+    get:
+      summary: Open orders
+      tags: [Account]
+
+  /account/{address}/trades:
+    get:
+      summary: Trade history
+      tags: [Account]
+
+  /account/{address}/funding:
+    get:
+      summary: Funding payment history
+      tags: [Account]
+
+  /health:
+    get:
+      summary: Health check
+      tags: [System]
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      tags: [System]
+
+# WebSocket: ws://api.gaekju.xyz/ws
+# Channels: orderbook:{market}, trades:{market}, positions:{account}, orders:{account}
+# See docs/api/websocket-api.md for full WebSocket specification
