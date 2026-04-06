@@ -959,7 +959,7 @@ gaekju/
 │   ├── gaekju-keeper/
 │   ├── gaekju-sdk/
 │   ├── gaekju-cli/
-│   └── gaekju-bots/              # Market making + simulation bots
+│   └── gaekju-mirror/              # Hyperliquid liquidity mirror
 │
 ├── docs/
 │   ├── specs/
@@ -1541,567 +1541,538 @@ fundingPayment = mulFp(mulFp(positionSize, fundingDelta), markPrice)
 
 ---
 
-## 11. Live Market Operations — From Empty Book to Active Exchange
+## 11. Live Market Operations — Hyperliquid Mirror + Testnet Traders
 
-This section covers the full lifecycle of how Gaekju creates a live trading experience: how a single order becomes a fill, how liquidity appears, and how the testnet feels like a real exchange.
+Gaekju connects to **Hyperliquid** as its liquidity source. Real Hyperliquid orderbook depth is mirrored onto Gaekju's on-chain book. Testnet users trade against this real-world depth, and their orders coexist with the mirrored orders on the same on-chain orderbook.
 
-### 11.1 How a Trade Actually Happens (End-to-End)
-
-Here's every step from a trader's click to their position appearing on screen.
-
-#### Step 1: Trader Prepares
+### 11.1 System Architecture
 
 ```
-Trader has:
-  - Wallet connected to Giwa L2
-  - USDC deposited in Vault (already on-chain)
-  - Free margin available (not locked by other positions/orders)
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Gaekju Live Market System                     │
+│                                                                       │
+│   Hyperliquid                    Gaekju (Giwa L2)                    │
+│   ┌──────────────┐              ┌──────────────────────────────┐    │
+│   │ Real orderbook│  WebSocket  │        On-Chain Orderbook     │    │
+│   │ BTC-PERP     │────────────▶│                                │    │
+│   │ ETH-PERP     │              │  ┌────────────────────────┐  │    │
+│   │ SOL-PERP     │              │  │  Mirrored Depth        │  │    │
+│   │ ...          │   Mirror     │  │  (from Hyperliquid)    │  │    │
+│   └──────────────┘   Agent      │  ├────────────────────────┤  │    │
+│                        (Rust)   │  │  Testnet User Orders   │  │    │
+│   ┌──────────────┐      │      │  │  (from real users)     │  │    │
+│   │ Real trades  │──────┘      │  └────────────────────────┘  │    │
+│   │ (trade feed) │              │            │                  │    │
+│   └──────────────┘              │     Matching Engine           │    │
+│                                  │     (same rules for all)     │    │
+│   ┌──────────────┐              │            │                  │    │
+│   │ Pyth Oracle  │─────────────▶│     Oracle Adapter            │    │
+│   │ (real prices)│              │     (mark + index price)      │    │
+│   └──────────────┘              └──────────────────────────────┘    │
+│                                          │                            │
+│                                  ┌───────┴───────┐                   │
+│                                  │  Testnet Users │                   │
+│                                  │  trade against │                   │
+│                                  │  real depth    │                   │
+│                                  └───────────────┘                   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Step 2: Order Submission
+### 11.2 The Mirror Agent (`gaekju-mirror`)
+
+The Mirror Agent is the bridge between Hyperliquid and Gaekju. It reads Hyperliquid's live orderbook and trade feed, then places equivalent orders on Gaekju's on-chain orderbook.
+
+#### How It Works
 
 ```
-Trader wants: Buy 0.1 BTC-PERP at market
+Hyperliquid WebSocket API (info.hyperliquid.xyz/ws):
+  - L2 orderbook snapshots (top N levels, pushed every 100ms)
+  - Trade feed (every fill on Hyperliquid, real-time)
+  - Market info (funding rates, open interest, etc.)
 
-Frontend/SDK:
-  1. Read current best ask from API (WebSocket): $60,000.50
-  2. Build transaction: Router.placeOrder(
-       marketId: 0,          // BTC-USD
-       side: true,           // buy
-       price: 0,             // market order (no price limit)
-       size: 0.1e18,         // 0.1 BTC in 18-decimal
-       orderType: MARKET
-     )
-  3. Sign transaction with wallet
-  4. Submit to Giwa L2 RPC endpoint
-
-Timeline: ~50-200ms (wallet signing + RPC submission)
+Mirror Agent reads this data and translates it to Gaekju on-chain orders.
 ```
 
-#### Step 3: Transaction Hits the Sequencer
+#### Orderbook Mirroring (Depth)
 
 ```
-Giwa L2 Sequencer:
-  1. Receives the transaction
-  2. Orders it (FCFS within block, ~2s block time on OP Stack)
-  3. Executes the transaction in the EVM
+Every ~2 seconds (one Giwa block), the Mirror Agent:
 
-  What happens inside the EVM in ONE transaction:
-  ┌─────────────────────────────────────────────────────┐
-  │ Router.placeOrder()                                  │
-  │  ├─ MarginEngine.checkInitialMargin()               │
-  │  │   └─ Verify: free margin >= 0.1 * $60,000 / 50x │
-  │  │       = $120 required margin ✓                    │
-  │  │                                                    │
-  │  ├─ OrderBook.placeOrder(MARKET, BUY, 0.1)          │
-  │  │   ├─ Walk the ask side from bestAskTick           │
-  │  │   │                                                │
-  │  │   │  Ask book state:                               │
-  │  │   │  ┌─────────────────────────────────────┐      │
-  │  │   │  │ $60,000.50  0.05 BTC  (Maker A)    │ ← fill│
-  │  │   │  │ $60,000.60  0.03 BTC  (Maker B)    │ ← fill│
-  │  │   │  │ $60,000.70  0.10 BTC  (Maker C)    │ ← partial│
-  │  │   │  │ $60,001.00  0.20 BTC  (Maker D)    │      │
-  │  │   │  └─────────────────────────────────────┘      │
-  │  │   │                                                │
-  │  │   ├─ Fill 1: 0.05 BTC @ $60,000.50 vs Maker A   │
-  │  │   ├─ Fill 2: 0.03 BTC @ $60,000.60 vs Maker B   │
-  │  │   ├─ Fill 3: 0.02 BTC @ $60,000.70 vs Maker C   │
-  │  │   │  (Maker C has 0.08 remaining)                 │
-  │  │   │                                                │
-  │  │   ├─ For each fill:                               │
-  │  │   │   ├─ Vault.unlockOrderMargin(maker)           │
-  │  │   │   ├─ PositionManager.updatePosition(taker)    │
-  │  │   │   ├─ PositionManager.updatePosition(maker)    │
-  │  │   │   └─ emit Fill(market, maker, taker, price, size) │
-  │  │   │                                                │
-  │  │   └─ Update bestAskTick to $60,000.70             │
-  │  │                                                    │
-  │  └─ Taker's final state:                             │
-  │      Position: LONG 0.1 BTC                          │
-  │      Avg entry: $60,000.56 (weighted average)        │
-  │      Locked margin: $120                              │
-  │      3 Fill events emitted                            │
-  └─────────────────────────────────────────────────────┘
+  1. READ: Fetch Hyperliquid BTC-PERP L2 orderbook (top 20 levels)
 
-Gas cost: ~200-400k gas (3 fills + state updates)
-L2 cost: ~$0.01-0.05 at typical OP Stack gas prices
-Block confirmation: ~2 seconds
+     Hyperliquid book (real):
+     ASK $60,010  2.50 BTC
+     ASK $60,005  1.20 BTC
+     ASK $60,003  0.80 BTC
+     ASK $60,001  0.30 BTC
+     ─── spread ───
+     BID $59,999  0.25 BTC
+     BID $59,997  0.90 BTC
+     BID $59,995  1.50 BTC
+     BID $59,990  3.00 BTC
+
+  2. SCALE: Apply a depth multiplier (e.g., 0.1x = show 10% of real depth)
+     This makes the book proportional to what Gaekju can handle.
+
+     Scaled for Gaekju:
+     ASK $60,010  0.25 BTC
+     ASK $60,005  0.12 BTC
+     ASK $60,003  0.08 BTC
+     ASK $60,001  0.03 BTC
+     ─── spread ───
+     BID $59,999  0.025 BTC
+     BID $59,997  0.09 BTC
+     BID $59,995  0.15 BTC
+     BID $59,990  0.30 BTC
+
+  3. DIFF: Compare with currently live mirror orders on Gaekju
+     - New levels to add? → Place limit orders
+     - Levels that changed size? → Cancel + replace
+     - Levels that disappeared? → Cancel
+     - Levels that didn't change? → Leave alone (save gas)
+
+  4. SUBMIT: Send batch transaction to Gaekju
+     Router.batchPlaceOrders([...new/updated orders])
+     Router.batchCancel([...stale orderIds])
+
+  Result: Gaekju's orderbook tracks Hyperliquid's within ~2 seconds.
 ```
 
-#### Step 4: Events Propagate
+#### Trade Mirroring (Activity)
 
 ```
-On-chain events emitted in the transaction receipt:
+When a real trade happens on Hyperliquid:
 
-  Fill(marketId=0, maker=MakerA, taker=Trader, price=60000.50e18, size=0.05e18, takerSide=BUY)
-  Fill(marketId=0, maker=MakerB, taker=Trader, price=60000.60e18, size=0.03e18, takerSide=BUY)
-  Fill(marketId=0, maker=MakerC, taker=Trader, price=60000.70e18, size=0.02e18, takerSide=BUY)
-  OrderMatched(marketId=0, makerOrderId=42, takerOrderId=0, price=60000.50e18, size=0.05e18)
-  OrderMatched(marketId=0, makerOrderId=43, takerOrderId=0, price=60000.60e18, size=0.03e18)
-  OrderMatched(marketId=0, makerOrderId=44, takerOrderId=0, price=60000.70e18, size=0.02e18)
-  PositionUpdated(account=Trader, marketId=0, size=0.1e18, entryPrice=60000.56e18)
+  Hyperliquid trade: BTC-PERP, 0.5 BTC @ $60,001, buyer aggressive
 
-Indexer picks up these events within ~1 second of block confirmation.
+  Mirror Agent:
+    1. Receives trade via WebSocket
+    2. Records it for the Gaekju trade feed (via indexer/API)
+    3. The mirrored orderbook already reflects this:
+       - The ask at $60,001 that got filled on Hyperliquid
+         also gets removed from Gaekju's mirror on next refresh
+       - Price movement is naturally reflected
+
+  Trade feed on Gaekju shows TWO types of trades:
+    a) Mirrored trades: real Hyperliquid trades, displayed in the feed
+       (tagged as "external" in the API, shown on the chart)
+    b) Testnet trades: actual on-chain fills between testnet users
+       and mirror orders (tagged as "local")
+
+  Both appear on the same chart. Price movement comes from real markets.
 ```
 
-#### Step 5: User Sees the Result
+#### Mirror Agent Account
 
 ```
-API Server (fed by Indexer):
+The Mirror Agent operates a single on-chain account on Gaekju:
 
-  WebSocket push to Trader's frontend:
-    {"channel": "orders", "data": {"status": "filled", "avgPrice": "60000.56", "fills": 3}}
-    {"channel": "positions", "data": {"market": 0, "side": "long", "size": "0.1", "entry": "60000.56"}}
+  Account: 0xMIRROR (dedicated address)
+  Funded:  Unlimited testnet USDC (minted at deployment)
+  Role:    Places and cancels orders that mirror Hyperliquid depth
 
-  WebSocket push to ALL subscribers of orderbook:BTC-USD:
-    {"channel": "orderbook", "data": {"asks": [["60000.70", "0.08"], ["60001.00", "0.20"], ...], "seq": 456}}
+  This account:
+  - Has special minting rights for testnet USDC (admin-granted)
+  - Places real on-chain limit orders (Post-Only to avoid self-matching)
+  - Can accumulate positions when testnet users fill against it
+  - Positions are irrelevant (testnet USDC is free) — no risk management needed
+  - Is publicly labeled: "Hyperliquid Mirror" in API/frontend
 
-  WebSocket push to ALL subscribers of trades:BTC-USD:
-    {"channel": "trades", "data": [
-      {"price": "60000.50", "size": "0.05", "side": "buy", "time": 1712419200},
-      {"price": "60000.60", "size": "0.03", "side": "buy", "time": 1712419200},
-      {"price": "60000.70", "size": "0.02", "side": "buy", "time": 1712419200}
-    ]}
-
-Total latency (submit → see result): ~2-4 seconds
-  - 50-200ms: signing + RPC submission
-  - ~2s: block inclusion
-  - ~500ms: indexer processes + API pushes
+  The account does NOT:
+  - Execute any trading strategy
+  - Make directional bets
+  - Need inventory management (unlimited capital on testnet)
 ```
 
-#### Full Timeline Comparison
+### 11.3 How Testnet Users Trade Against Real Depth
 
 ```
-              Gaekju (on-chain)        Hyperliquid (off-chain)      Binance (CEX)
-Submit        50-200ms                 1-5ms                         1-5ms
-Match         ~2s (next block)         ~1ms (in-memory)              ~1ms
-Confirm       ~2s (L2 block)           ~1s (HyperBFT)                instant
-See result    ~3-4s total              ~1-2s total                   ~50ms total
-Settlement    instant (on-chain)       batched to L1                 internal ledger
-Trust         trustless (L2)           trust operator                trust exchange
-```
+Scenario: Alice (testnet user) wants to long 0.1 BTC
 
-### 11.2 Liquidity — Where Do Fills Come From?
-
-On an empty exchange, there's nobody on the other side of your trade. Here's how a live market builds liquidity layer by layer:
-
-#### Layer 1: Designated Market Makers (DMMs)
-
-Professional or semi-professional market makers who commit to providing continuous liquidity.
-
-```
-How a market maker works on Gaekju:
-
-  MM has: 500,000 USDC deposited in Vault
-  MM runs: gaekju-sdk based bot on a server
-
-  Every block (~2s), the MM bot:
-    1. Reads Pyth oracle price: BTC = $60,000
-    2. Reads current inventory: net long 0.3 BTC from previous fills
-    3. Calculates fair value: $60,000 (oracle) adjusted for inventory risk
-    4. Sets quotes:
-
-       BID SIDE (where MM buys):                ASK SIDE (where MM sells):
-       $59,997  0.05 BTC  (3 bps below mid)     $60,003  0.05 BTC  (3 bps above mid)
-       $59,994  0.05 BTC  (6 bps)               $60,006  0.05 BTC  (6 bps)
-       $59,991  0.10 BTC  (9 bps)               $60,009  0.10 BTC  (9 bps)
-       $59,985  0.10 BTC  (15 bps)              $60,015  0.10 BTC  (15 bps)
-       $59,970  0.20 BTC  (30 bps)              $60,030  0.20 BTC  (30 bps)
-       ─────────────────────                     ─────────────────────
-       Total: 0.50 BTC bid depth                 Total: 0.50 BTC ask depth
-
-    5. Since MM is long 0.3 BTC, skew quotes:
-       - Tighten ask spread (want to sell, reduce inventory)
-       - Widen bid spread (less eager to buy more)
-       - Adjusted: bids 5bps wider, asks 2bps tighter
-
-    6. Cancel old orders, place new batch: Router.batchPlaceOrders()
-
-  When a retail trader market-buys 0.1 BTC:
-    - Fills against MM's ask at $60,003 and $60,006
-    - MM is now long 0.4 BTC (inventory increased)
-    - Next refresh: MM skews quotes further to shed inventory
-    - MM profits from the spread ($60,003 - $59,997 = $6/BTC = 1 bps)
-
-  Revenue model for MM:
-    spread capture - inventory risk - gas costs - funding payments = profit
-    On testnet: MM bots run at break-even, purpose is liquidity not profit
-```
-
-#### Layer 2: Fee Incentives for Makers
-
-How real exchanges attract market makers:
-
-```
-Fee structure (maker-taker model):
+  The Gaekju orderbook right now:
   ┌──────────────────────────────────────────────────┐
-  │  Maker fee:  -0.01% (REBATE — makers get PAID)   │
-  │  Taker fee:  +0.05%                               │
-  │                                                    │
-  │  A maker placing a limit order that rests on the   │
-  │  book EARNS 0.01% of the fill notional when it     │
-  │  gets filled. Takers pay 0.05%.                    │
-  │                                                    │
-  │  Net protocol revenue: 0.04% per trade             │
+  │  ASK $60,010  0.25  [Mirror]                      │
+  │  ASK $60,005  0.12  [Mirror]                      │
+  │  ASK $60,003  0.08  [Mirror]                      │
+  │  ASK $60,001  0.03  [Mirror] + 0.02 [Bob testnet] │ ← best ask
+  │  ─── spread ───                                    │
+  │  BID $59,999  0.025 [Mirror] + 0.05 [Carol testnet]│ ← best bid
+  │  BID $59,997  0.09  [Mirror]                      │
+  │  BID $59,995  0.15  [Mirror]                      │
+  │  BIDS                                              │
   └──────────────────────────────────────────────────┘
 
-  Example: 0.1 BTC trade at $60,000 = $6,000 notional
-    Taker pays:  $6,000 * 0.05% = $3.00
-    Maker earns: $6,000 * 0.01% = $0.60
-    Protocol:    $3.00 - $0.60 = $2.40
+  Alice submits: Market Buy 0.1 BTC
 
-  This incentivizes anyone to place limit orders — you get paid for providing liquidity.
+  Matching engine walks the ask side (no special treatment):
+    Fill 1: 0.02 BTC @ $60,001 from Bob (testnet user)
+    Fill 2: 0.03 BTC @ $60,001 from Mirror
+    Fill 3: 0.05 BTC @ $60,003 from Mirror
+
+  Results:
+    Alice: LONG 0.1 BTC, avg entry $60,002.00
+    Bob:   SHORT 0.02 BTC (his limit order got filled by Alice)
+    Mirror: accumulates 0.08 BTC short position (doesn't matter — testnet)
+
+  What makes this feel real:
+  ✓ Alice got filled at a realistic price (tracks Hyperliquid within 2s)
+  ✓ The slippage was realistic (0.08 BTC ate through 3 price levels)
+  ✓ Bob (another real testnet user) was on the other side of part of the fill
+  ✓ The orderbook updates immediately on-chain
+  ✓ Funding rates reflect real market conditions (via Pyth oracle)
 ```
 
-Implementation in contracts:
-
-```solidity
-// In OrderBook, on each fill:
-struct FeeConfig {
-    int256 makerFeeRate;    // -1e14 = -0.01% (negative = rebate)
-    int256 takerFeeRate;    // 5e14  = +0.05%
-}
-
-// On fill execution:
-notional = mulFp(fillSize, fillPrice)
-makerFee = mulFp(notional, makerFeeRate)  // negative = rebate to maker
-takerFee = mulFp(notional, takerFeeRate)  // positive = charge taker
-
-vault.realizePnl(maker, -makerFee)  // maker receives rebate
-vault.realizePnl(taker, -takerFee)  // taker pays fee
-protocolRevenue += takerFee + makerFee  // net positive
-```
-
-#### Layer 3: Organic Traders
-
-Once there's a visible orderbook with tight spreads and some trading activity, organic traders arrive:
+### 11.4 Hyperliquid API Integration
 
 ```
-Organic trader attraction funnel:
+Hyperliquid provides free, unauthenticated WebSocket API:
 
-  1. Trader visits Gaekju → sees BTC-USD orderbook
-  2. Sees: tight spread (6 bps), deep book (0.5 BTC each side)
-  3. Sees: recent trades happening every few seconds
-  4. Sees: price tracking Binance/real market within a few bps
-  5. Thinks: "this looks legit, I can trade here"
-  6. Deposits testnet USDC from faucet
-  7. Places first trade → gets filled instantly against MM orders
-  8. Their limit orders add to the book → more liquidity
-  9. Flywheel: more liquidity → tighter spreads → more traders
+  Endpoint: wss://api.hyperliquid.xyz/ws
+
+  Subscribe to L2 book:
+    {"method": "subscribe", "subscription": {"type": "l2Book", "coin": "BTC"}}
+
+  Receive (every ~100ms):
+    {
+      "channel": "l2Book",
+      "data": {
+        "coin": "BTC",
+        "levels": [
+          [["60001.0", "0.30", 4], ["60003.0", "0.80", 8], ...],  // asks [price, size, numOrders]
+          [["59999.0", "0.25", 3], ["59997.0", "0.90", 6], ...]   // bids
+        ],
+        "time": 1712419200123
+      }
+    }
+
+  Subscribe to trades:
+    {"method": "subscribe", "subscription": {"type": "trades", "coin": "BTC"}}
+
+  Receive (on each trade):
+    {
+      "channel": "trades",
+      "data": [{
+        "coin": "BTC",
+        "side": "A",           // A=ask aggressor (buyer), B=bid aggressor (seller)
+        "px": "60001.0",
+        "sz": "0.50",
+        "time": 1712419200456,
+        "hash": "0x..."
+      }]
+    }
 ```
 
-### 11.3 Making the Testnet Feel Like a Real Exchange
-
-The challenge: on testnet, money isn't real, so behavior is weird. Here's how to create realistic conditions:
-
-#### Price Feed Realism
+#### Market Mapping
 
 ```
-Gaekju prices track REAL market prices because we use Pyth oracle:
+Hyperliquid Coin    →    Gaekju Market
+BTC                 →    BTC-USD (marketId: 0)
+ETH                 →    ETH-USD (marketId: 1)
+SOL                 →    SOL-USD (marketId: 2)
+ARB                 →    ARB-USD (marketId: 3)
+OP                  →    OP-USD  (marketId: 4)
+DOGE                →    DOGE-USD (marketId: 5)
 
-  Pyth BTC/USD feed → real Binance/Coinbase/Kraken aggregated price
-    ↓
-  OracleAdapter.getIndexPrice() → $60,000.00 (real world price)
-    ↓
-  Mark price blend → 70% oracle + 30% orderbook mid
-    ↓
-  Displayed price on Gaekju ≈ real BTC price ± a few bps
-
-  Result: Gaekju chart looks like a real BTC chart.
-  Price discovery is real. Only the USDC is testnet.
+RWA markets (EUR, XAU, etc.) don't have Hyperliquid equivalents.
+For those: Pyth oracle price only, no depth mirror.
+Testnet users provide all liquidity for RWA markets organically.
 ```
 
-#### Orderbook Depth Realism
-
-How to make the book look like Binance, not like a dead testnet:
-
-```
-Target book state (BTC-USD):
-
-  ASKS                              BIDS
-  $60,030.00   0.50 BTC            $59,970.00   0.50 BTC
-  $60,020.00   0.30 BTC            $59,980.00   0.30 BTC
-  $60,015.00   0.20 BTC            $59,985.00   0.20 BTC
-  $60,010.00   0.10 BTC            $59,990.00   0.10 BTC
-  $60,006.00   0.05 BTC ← MM      $59,994.00   0.05 BTC ← MM
-  $60,003.00   0.05 BTC ← MM      $59,997.00   0.05 BTC ← MM
-  ──────────── spread: $6 (1 bps) ────────────
-
-  Sources of this depth:
-  ├─ MM bot: inner 2-3 levels (tight, always refreshed)
-  ├─ Grid bot: outer levels (passive, wider spacing)
-  └─ Organic limit orders: anywhere (from real users)
-
-  Key: the book ALWAYS has something to trade against.
-  A market buy of 0.5 BTC would cost ~$60,015 avg (2.5 bps slippage).
-  This is realistic for a mid-tier exchange.
-```
-
-#### Trade Flow Realism
-
-A realistic exchange has varied trade patterns. Here's the target:
-
-```
-Trade pattern over 1 hour (BTC-USD):
-
-  Minute 0-5:   quiet, 2-3 small trades/min (organic browsing)
-  Minute 5-10:  BTC moves 0.5%, flurry of 8-10 trades/min
-  Minute 10-15: cooling off, 3-4 trades/min
-  Minute 15-20: large order hits, 0.5 BTC trade, MM rebalances
-  Minute 20-30: steady, 4-6 trades/min
-  Minute 30-35: another price move, liquidation triggers
-  Minute 35-60: steady background activity
-
-  This comes from:
-  ├─ MM bot requoting every block (creates matched trades when price moves)
-  ├─ Simulation bots (configurable trade frequency and patterns)
-  └─ Organic traders (unpredictable, adds genuine randomness)
-```
-
-#### Slippage Realism
-
-```
-Slippage by order size (BTC-USD, target):
-
-  Size          Slippage     Comparable to
-  0.01 BTC      <1 bps       Binance large-cap
-  0.1 BTC       2-5 bps      Binance mid-cap
-  0.5 BTC       10-20 bps    dYdX / Hyperliquid
-  1.0 BTC       30-50 bps    smaller CEX
-  5.0 BTC       100+ bps     thin market
-
-  Controlled by:
-  ├─ MM depth per level (sizePerLevel config)
-  ├─ Number of levels (numLevels config)
-  └─ Grid bot density
-```
-
-### 11.4 The Simulation Engine (`gaekju-bots`)
+### 11.5 Mirror Agent Crate
 
 ```
 crates/
-└── gaekju-bots/
+└── gaekju-mirror/              # Hyperliquid ↔ Gaekju liquidity bridge
     ├── src/
-    │   ├── main.rs              # Run all bots as one process
-    │   ├── config.rs            # TOML config loader
-    │   ├── engine.rs            # Core simulation loop
+    │   ├── main.rs              # Entry point, config loading
+    │   ├── config.rs            # Mirror config (markets, depth scale, etc.)
     │   │
-    │   ├── market_maker/
+    │   ├── hyperliquid/
     │   │   ├── mod.rs
-    │   │   ├── quoting.rs       # Bid/ask price calculation
-    │   │   ├── inventory.rs     # Inventory tracking + skew
-    │   │   ├── hedging.rs       # Cross-market hedging (optional)
-    │   │   └── oracle.rs        # Pyth price tracking + TWAP
+    │   │   ├── ws.rs            # WebSocket connection to Hyperliquid
+    │   │   ├── types.rs         # L2Book, Trade, MarketInfo types
+    │   │   └── parser.rs        # Parse Hyperliquid JSON messages
     │   │
-    │   ├── simulation/
+    │   ├── mirror/
     │   │   ├── mod.rs
-    │   │   ├── persona.rs       # Trader personality definitions
-    │   │   ├── scheduler.rs     # When to trade (Poisson process)
-    │   │   ├── sizing.rs        # How much to trade (log-normal)
-    │   │   └── decision.rs      # Buy/sell/hold logic per persona
+    │   │   ├── book_sync.rs     # Diff Hyperliquid book vs Gaekju orders
+    │   │   ├── order_manager.rs # Track which on-chain orders are ours
+    │   │   ├── trade_relay.rs   # Relay Hyperliquid trades to API
+    │   │   └── scaler.rs        # Scale depth (e.g., 10% of real book)
     │   │
-    │   ├── grid/
+    │   ├── chain/
     │   │   ├── mod.rs
-    │   │   └── rebalancer.rs    # Grid order management
+    │   │   ├── submitter.rs     # Batch order submission to Gaekju contracts
+    │   │   ├── nonce.rs         # Nonce management for rapid txs
+    │   │   └── gas.rs           # Gas estimation
     │   │
     │   └── monitoring/
     │       ├── mod.rs
-    │       ├── pnl.rs           # Track each bot's PnL
-    │       ├── metrics.rs       # Prometheus metrics for bot health
-    │       └── alerts.rs        # Alert if bot hits risk limits
+    │       ├── metrics.rs       # Prometheus: sync lag, order count, gas spent
+    │       └── health.rs        # Alert if Hyperliquid WS disconnects
     │
-    └── config/
-        ├── default.toml         # Default configs
-        ├── btc-usd.toml         # BTC market-specific overrides
-        └── eth-usd.toml
+    └── Cargo.toml
 ```
 
-Bot config example (`config/default.toml`):
+#### Config
 
 ```toml
-[market_maker]
-enabled = true
-spread_bps = 10
-num_levels = 5
-size_per_level = "0.05"     # BTC
-refresh_interval_ms = 2000   # every block
-max_inventory = "2.0"        # max 2 BTC net position
-skew_factor = "0.5"          # how aggressively to skew quotes
-oracle_weight = 0.7          # mark price blend
-initial_usdc = "500000"
+# gaekju-mirror config
+[hyperliquid]
+ws_url = "wss://api.hyperliquid.xyz/ws"
+reconnect_interval_ms = 5000
 
-[simulation]
-enabled = true
-num_personas = 20
+[mirror]
+depth_scale = 0.1          # Show 10% of Hyperliquid's real depth
+max_levels = 15            # Mirror top 15 price levels per side
+refresh_interval_ms = 2000 # Sync every Giwa block (~2s)
+min_order_size = "0.001"   # Don't mirror tiny levels
 
-[[simulation.personas]]
-name = "scalper"
-count = 8
-avg_trades_per_hour = 30
-avg_hold_minutes = 5
-size_mean = "0.01"
-size_std = "0.005"
-strategy = "momentum"
+[mirror.markets]
+BTC = { gaekju_market_id = 0, enabled = true }
+ETH = { gaekju_market_id = 1, enabled = true }
+SOL = { gaekju_market_id = 2, enabled = true }
+ARB = { gaekju_market_id = 3, enabled = true }
+OP  = { gaekju_market_id = 4, enabled = true }
 
-[[simulation.personas]]
-name = "swing"
-count = 6
-avg_trades_per_hour = 4
-avg_hold_minutes = 120
-size_mean = "0.05"
-size_std = "0.02"
-strategy = "mean_reversion"
-
-[[simulation.personas]]
-name = "whale"
-count = 2
-avg_trades_per_hour = 1
-avg_hold_minutes = 360
-size_mean = "0.5"
-size_std = "0.2"
-strategy = "trend_following"
-
-[[simulation.personas]]
-name = "random"
-count = 4
-avg_trades_per_hour = 6
-avg_hold_minutes = 30
-size_mean = "0.02"
-size_std = "0.01"
-strategy = "random"
-
-[grid]
-enabled = true
-spacing_ticks = 10
-num_orders_per_side = 20
-order_size = "0.02"
-initial_usdc = "100000"
+[chain]
+rpc_url = "https://rpc.giwa.chain"
+mirror_account_key = "0x..."   # Private key for mirror account
+max_gas_per_tx = 2000000
+batch_size = 50                # Max orders per batch tx
 
 [monitoring]
-prometheus_port = 9091
-pnl_log_interval_secs = 60
-max_loss_per_bot_usdc = "10000"  # halt bot if it loses more than this
+prometheus_port = 9092
 ```
 
-### 11.5 How Bots Blend with Real Users
+### 11.6 The Sync Loop (Core Algorithm)
 
-```
-                    ┌─────────────────────────────────────────┐
-                    │           Gaekju Orderbook                │
-                    │                                           │
-                    │  ASKS          ← source                   │
-                    │  $60,030  0.50  [Grid bot]                │
-                    │  $60,020  0.30  [Grid bot]                │
-                    │  $60,010  0.15  [Real user] + 0.05 [MM]  │
-                    │  $60,005  0.05  [MM bot]                  │
-                    │  ────── spread ──────                      │
-                    │  $59,995  0.05  [MM bot]                  │
-                    │  $59,990  0.10  [MM bot] + 0.08 [Real]   │
-                    │  $59,980  0.30  [Grid bot]                │
-                    │  $59,970  0.50  [Grid bot]                │
-                    │  BIDS                                      │
-                    └─────────────────────────────────────────┘
+```rust
+// Simplified pseudocode for the mirror sync loop
 
-  A real user places a market buy for 0.1 BTC:
-    Fill 1: 0.05 @ $60,005 from MM bot     ← bot provides liquidity
-    Fill 2: 0.05 @ $60,010 from real user  ← organic liquidity
+struct MirrorState {
+    // Currently live mirror orders on Gaekju, keyed by (market, side, tick)
+    live_orders: HashMap<(MarketId, Side, Tick), OrderId>,
+}
 
-  The user doesn't know (or care) which fills came from bots vs humans.
-  All orders are on-chain. All fills are real smart contract executions.
-  There is NO difference in how bot orders and human orders are processed.
-```
+async fn sync_loop(hl_ws: HyperliquidWs, chain: GaekjuChain, config: Config) {
+    let mut state = MirrorState::new();
 
-#### Transparency Model
+    loop {
+        // 1. Get latest Hyperliquid book for all markets
+        let hl_books = hl_ws.get_latest_books().await;
 
-```
-Option A: Fully transparent (recommended for testnet)
-  - Bot accounts are labeled in the API/frontend
-  - "Liquidity provided by Gaekju MM" badge on bot orders
-  - Dashboard showing: organic vs bot volume ratio
-  - Goal: build trust, show honest bootstrapping
+        for (coin, hl_book) in hl_books {
+            let market_id = config.market_mapping[&coin];
+            let scale = config.depth_scale;  // e.g., 0.1
 
-Option B: Unlabeled (for production feel)
-  - Bot accounts are normal accounts
-  - Users can't distinguish bot from human
-  - Used when organic volume exceeds 50% of total
-```
+            // 2. Build target book state (what Gaekju should look like)
+            let mut target_orders: Vec<(Side, Price, Size)> = vec![];
+            for (price, size, _) in hl_book.asks.iter().take(config.max_levels) {
+                let scaled = size * scale;
+                if scaled >= config.min_order_size {
+                    target_orders.push((ASK, price, scaled));
+                }
+            }
+            for (price, size, _) in hl_book.bids.iter().take(config.max_levels) {
+                let scaled = size * scale;
+                if scaled >= config.min_order_size {
+                    target_orders.push((BID, price, scaled));
+                }
+            }
 
-### 11.6 Cold Start → Live Market Progression
+            // 3. Diff against current live orders
+            let mut to_place: Vec<Order> = vec![];
+            let mut to_cancel: Vec<OrderId> = vec![];
 
-```
-Week 0: Launch Day
-  ├─ Deploy contracts
-  ├─ Start MM bot → orderbook appears within 1 block
-  ├─ Start grid bot → deep liquidity within 5 minutes
-  ├─ Start simulation bots → trade feed starts flowing
-  ├─ Orderbook looks active: tight spreads, trades every few seconds
-  └─ Announce: "Gaekju testnet is live, BTC-USD with 50x leverage"
+            // Cancel orders at levels that no longer exist or changed significantly
+            for ((m, side, tick), order_id) in &state.live_orders {
+                if *m != market_id { continue; }
+                let still_exists = target_orders.iter().any(|(s, p, _)|
+                    *s == *side && price_to_tick(*p) == *tick
+                );
+                if !still_exists {
+                    to_cancel.push(*order_id);
+                }
+                // Also cancel if size changed >20% (requote)
+            }
 
-Week 1-2: Early Users
-  ├─ Users claim testnet USDC from faucet
-  ├─ Their orders mix into the book alongside bot orders
-  ├─ Bot activity masks low organic volume (feels alive)
-  ├─ Track metric: organic_volume / total_volume (target: >5%)
-  └─ Adjust bot aggressiveness if organic orders aren't getting filled
+            // Place orders at new or changed levels
+            for (side, price, size) in &target_orders {
+                let tick = price_to_tick(*price);
+                if !state.live_orders.contains_key(&(market_id, *side, tick)) {
+                    to_place.push(Order {
+                        market_id, side: *side, price: *price, size: *size,
+                        order_type: POST_ONLY,  // never aggress
+                    });
+                }
+            }
 
-Week 3-4: Growing Organic
-  ├─ Reduce simulation bot trade frequency by 30%
-  ├─ Organic volume should compensate
-  ├─ MM bot stays at full capacity (always needed)
-  ├─ Track: organic_volume / total_volume (target: >20%)
-  └─ Add more markets based on demand (SOL, OP, EUR)
+            // 4. Submit batch to chain
+            if !to_cancel.is_empty() {
+                chain.batch_cancel(market_id, &to_cancel).await?;
+            }
+            if !to_place.is_empty() {
+                let order_ids = chain.batch_place(market_id, &to_place).await?;
+                // Update state with new order IDs
+                for (order, id) in to_place.iter().zip(order_ids) {
+                    let tick = price_to_tick(order.price);
+                    state.live_orders.insert((market_id, order.side, tick), id);
+                }
+            }
 
-Month 2+: Self-Sustaining
-  ├─ Disable simulation bots entirely
-  ├─ MM bot continues (even Binance has market makers)
-  ├─ Grid bot continues as backstop depth
-  ├─ Organic volume dominates
-  └─ Track: could the exchange run without bots? Target: mostly yes.
-```
+            // Clean up cancelled orders from state
+            for id in &to_cancel {
+                state.live_orders.retain(|_, v| v != id);
+            }
+        }
 
-### 11.7 Key Metrics to Monitor
-
-```
-Dashboard: Gaekju Market Health
-
-  ┌─────────────────────────────────────────────────────┐
-  │ BTC-USD                                              │
-  │                                                       │
-  │ Spread:        6 bps ($3.60)       ✅ target: <10bps │
-  │ Bid depth:     0.82 BTC            ✅ target: >0.5   │
-  │ Ask depth:     0.75 BTC            ✅ target: >0.5   │
-  │ 24h volume:    45.3 BTC ($2.7M)    ✅                 │
-  │ Organic ratio: 34%                 ⚠️  target: >50%  │
-  │ Trades/hour:   142                  ✅ target: >50    │
-  │ Avg slippage:  3.2 bps (0.1 BTC)  ✅ target: <10bps │
-  │ MM uptime:     99.8%               ✅ target: >99%   │
-  │ Open interest: 12.4 BTC            ✅                 │
-  │ Funding rate:  +0.003%             (longs paying)     │
-  │ Liquidations:  2 (24h)                                │
-  └─────────────────────────────────────────────────────┘
+        // 5. Wait for next block
+        chain.wait_next_block().await;
+    }
+}
 ```
 
-### 11.8 Build Phase Integration
+### 11.7 Trade Feed Integration
+
+Hyperliquid's real trades appear in Gaekju's trade feed alongside testnet trades:
 
 ```
-Phase 5 tasks (gaekju-bots crate):
-  - [ ] Market maker bot: oracle tracking, quoting, inventory management
-  - [ ] Grid bot: auto-rebalancing grid orders
-  - [ ] Simulation engine: persona system, scheduler, decision logic
-  - [ ] Config system: per-market TOML configs
-  - [ ] Monitoring: PnL tracking, Prometheus metrics, risk alerts
-  - [ ] Bot account deployment script + testnet USDC funding
-  - [ ] Integration test: boot all bots → verify book depth in <60s
-  - [ ] Dashboard: market health metrics
-  - [ ] Blog post: "Bootstrapping a Live Market on Testnet"
+Gaekju API trade feed (WebSocket):
+
+  // Real Hyperliquid trade (relayed, informational)
+  {
+    "channel": "trades",
+    "market": 0,
+    "data": {
+      "price": "60001.0",
+      "size": "0.50",
+      "side": "buy",
+      "source": "hyperliquid",    // tagged as external
+      "time": 1712419200456
+    }
+  }
+
+  // Testnet user trade (actual on-chain fill)
+  {
+    "channel": "trades",
+    "market": 0,
+    "data": {
+      "price": "60001.0",
+      "size": "0.10",
+      "side": "buy",
+      "source": "gaekju",         // tagged as local
+      "txHash": "0xabc...",
+      "maker": "0x...",
+      "taker": "0x...",
+      "time": 1712419202000
+    }
+  }
+
+Frontend chart shows BOTH — the price line moves with real market data.
+Testnet user fills appear as distinct markers on the chart.
+```
+
+### 11.8 What This Means for Testnet Users
+
+```
+From the testnet user's perspective:
+
+  1. Open Gaekju → see BTC-USD at $60,001 (real price, same as Binance)
+  2. See deep orderbook with realistic spreads and depth
+  3. See trade feed with trades happening in real-time
+  4. Claim 10,000 testnet USDC from faucet
+  5. Place a market long 0.1 BTC → fills instantly at ~$60,001
+     (against mirror orders that reflect real Hyperliquid depth)
+  6. Watch position PnL move with real BTC price
+  7. Get liquidated if they use high leverage and BTC drops (real risk feel)
+  8. Pay/receive funding rates based on real market premium
+  9. Can also trade against OTHER testnet users' orders
+
+  What's real:
+  ✓ Prices (Pyth oracle = real aggregated price)
+  ✓ Orderbook depth shape (mirrors Hyperliquid)
+  ✓ Trade flow (Hyperliquid trades appear in feed)
+  ✓ Funding rates (calculated from real mark vs index)
+  ✓ Liquidation mechanics (fully functional)
+  ✓ Smart contract execution (everything is on-chain)
+
+  What's testnet:
+  ✗ USDC is not real money (free from faucet)
+  ✗ Mirror agent has unlimited capital (no real risk)
+  ✗ Mirror agent doesn't hedge on Hyperliquid (one-way bridge)
+  ✗ RWA markets have no depth mirror (oracle price only)
+```
+
+### 11.9 RWA Markets (No Mirror Available)
+
+For markets like EUR-USD, XAU-USD where Hyperliquid has no equivalent:
+
+```
+RWA markets operate differently:
+
+  Price: Pyth oracle only (real forex/commodity prices)
+  Depth: Provided entirely by testnet users' limit orders
+  No mirror agent for these markets
+
+  To bootstrap RWA liquidity:
+  1. Price feed is live from day one (Pyth has EUR/USD, XAU/USD feeds)
+  2. Lower leverage (10x) reduces capital requirements
+  3. Wider tick sizes reduce gas costs for market makers
+  4. RWA markets launch AFTER crypto markets have organic users
+     who might also want to trade forex/gold
+  5. If RWA books are too thin, consider adding a simple
+     price-based liquidity provider in v2 (trade against oracle
+     price ± configurable spread, like GMX)
+```
+
+### 11.10 Latency & Sync Quality
+
+```
+Sync chain:
+  Hyperliquid updates book → ~100ms
+  Mirror Agent receives WS  → ~50ms network
+  Mirror Agent diffs + submits tx → ~100ms compute
+  Giwa L2 block inclusion → ~2s
+  ─────────────────────────────
+  Total lag: ~2.5 seconds behind Hyperliquid
+
+  In practice this means:
+  - Slow price moves (normal trading): book tracks perfectly
+  - Fast price moves (>1% in 2s): mirror lags, testnet users
+    could fill at stale prices. This is acceptable on testnet.
+  - Flash crashes: mirror may show depth that doesn't exist anymore.
+    Mitigated by the Oracle staleness check (won't liquidate on stale data).
+
+  Sync metrics (target):
+  ├─ Book update latency: <3s (Hyperliquid → Gaekju visible)
+  ├─ Price accuracy: within 5 bps of Hyperliquid mid-price
+  ├─ Uptime: >99% (reconnect on WS drop)
+  └─ Gas efficiency: <500k gas per sync cycle per market
+```
+
+### 11.11 Build Phase Integration
+
+```
+Mirror Agent is part of Phase 5 (testnet launch):
+
+  - [ ] gaekju-mirror crate: Hyperliquid WS client
+  - [ ] L2 book parser and depth scaler
+  - [ ] Book diff algorithm (minimize on-chain order churn)
+  - [ ] Batch order submission with nonce management
+  - [ ] Trade relay to Gaekju API (external trade feed)
+  - [ ] Market mapping config (Hyperliquid coin → Gaekju marketId)
+  - [ ] Monitoring: sync lag, order count, gas usage, WS health
+  - [ ] Mirror account deployment + testnet USDC minting
+  - [ ] Integration test: start mirror → verify book matches HL within 5s
+  - [ ] Resilience: auto-reconnect, graceful degradation on HL downtime
+  - [ ] Blog post: "Bridging Real Liquidity to a Testnet DEX"
 
 Fee system tasks (added to Phase 3):
   - [ ] Implement maker-taker fee model in OrderBook
   - [ ] Maker rebate: -0.01% (paid to maker on fill)
   - [ ] Taker fee: +0.05% (charged to taker on fill)
   - [ ] Protocol revenue accumulation
-  - [ ] Fee tier system (volume-based discounts for Phase 6)
 ```
 
 ---
