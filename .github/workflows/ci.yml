@@ -8,12 +8,14 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - '.github/workflows/ci.yml'
   pull_request:
     paths:
       - 'contracts/**'
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - '.github/workflows/ci.yml'
 
 env:
   FOUNDRY_PROFILE: default
@@ -21,21 +23,26 @@ env:
 jobs:
   contracts:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: foundry-rs/foundry-toolchain@v1
-      - run: cd contracts && forge fmt --check
-      - run: cd contracts && forge build --sizes
-      - run: cd contracts && forge test -vvv
+      - name: Install dependencies
+        run: |
+          forge install OpenZeppelin/openzeppelin-contracts --no-git
+          forge install OpenZeppelin/openzeppelin-contracts-upgradeable --no-git
+          forge install pyth-network/pyth-sdk-solidity --no-git
+          forge install foundry-rs/forge-std --no-git
+      - run: forge fmt --check
+      - run: forge build
+      - run: forge test -vvv
 
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
