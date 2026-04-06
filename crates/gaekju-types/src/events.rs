@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, I256, U256};
 use alloy_sol_types::sol;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,40 @@ sol! {
     event MarginLocked(address indexed account, uint256 amount);
     event MarginUnlocked(address indexed account, uint256 amount);
     event PnlRealized(address indexed account, int256 amount);
+
+    event PositionUpdated(
+        address indexed account,
+        uint256 indexed marketId,
+        int256 newSize,
+        uint256 entryPrice,
+        uint256 collateral,
+        int256 realizedPnl
+    );
+
+    event PositionClosed(
+        address indexed account,
+        uint256 indexed marketId,
+        int256 realizedPnl
+    );
+
+    event PositionLiquidated(
+        address indexed account,
+        uint256 indexed marketId,
+        address indexed liquidator,
+        int256 sizeReduced,
+        uint256 liquidationPrice,
+        uint256 liquidatorFee,
+        uint256 insuranceFee,
+        bool isFullLiquidation
+    );
+
+    event AutoDeleveraged(
+        address indexed bankruptAccount,
+        address indexed counterparty,
+        uint256 indexed marketId,
+        int256 sizeReduced,
+        uint256 price
+    );
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,5 +110,35 @@ pub enum GaekjuEvent {
     Withdrawn {
         account: Address,
         amount: U256,
+    },
+    PositionUpdated {
+        account: Address,
+        market_id: U256,
+        new_size: I256,
+        entry_price: U256,
+        collateral: U256,
+        realized_pnl: I256,
+    },
+    PositionClosed {
+        account: Address,
+        market_id: U256,
+        realized_pnl: I256,
+    },
+    PositionLiquidated {
+        account: Address,
+        market_id: U256,
+        liquidator: Address,
+        size_reduced: I256,
+        liquidation_price: U256,
+        liquidator_fee: U256,
+        insurance_fee: U256,
+        is_full_liquidation: bool,
+    },
+    AutoDeleveraged {
+        bankrupt_account: Address,
+        counterparty: Address,
+        market_id: U256,
+        size_reduced: I256,
+        price: U256,
     },
 }

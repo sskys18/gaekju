@@ -25,6 +25,7 @@ interface IMarginEngine {
             uint256 minOrderSize
         );
 
+    function getConfig(uint256 marketId) external view returns (MarketConfig memory);
     function setMarketConfig(uint256 marketId, MarketConfig calldata config) external;
     function checkInitialMargin(address account, uint256 marketId, uint256 orderSize, uint256 price)
         external

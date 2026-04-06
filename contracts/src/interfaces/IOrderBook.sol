@@ -7,6 +7,7 @@ interface IOrderBook {
         returns (uint256 orderId);
 
     function cancelOrder(uint256 orderId) external;
+    function setPositionManager(address positionManager) external;
 
     function bestBidTick() external view returns (uint256);
     function bestAskTick() external view returns (uint256);

@@ -6,6 +6,7 @@ import { AccessControlUpgradeable } from "@openzeppelin/contracts-upgradeable/ac
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { IOrderBook } from "./interfaces/IOrderBook.sol";
 import { IVault } from "./interfaces/IVault.sol";
+import { IPositionManager } from "./interfaces/IPositionManager.sol";
 import { BitmapLib } from "./libraries/BitmapLib.sol";
 import { FixedPointMath } from "./libraries/FixedPointMath.sol";
 import { PackedOrder } from "./libraries/PackedOrder.sol";
@@ -60,6 +61,8 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
     // Track order margin per order for release on cancel/fill
     mapping(uint256 => uint256) public orderMarginAmount;
 
+    IPositionManager public positionManager;
+
     uint256[50] private __gap;
 
     function initialize(uint256 _marketId, address _vault, address _marginEngine, uint256 _tickSize, address _admin)
@@ -78,6 +81,10 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
     function setFeeConfig(int256 _makerFeeRate, int256 _takerFeeRate) external onlyRole(DEFAULT_ADMIN_ROLE) {
         makerFeeRate = _makerFeeRate;
         takerFeeRate = _takerFeeRate;
+    }
+
+    function setPositionManager(address _positionManager) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        positionManager = IPositionManager(_positionManager);
     }
 
     function placeOrder(address trader, bool side, uint256 price, uint256 size, uint8 orderType)
@@ -104,9 +111,9 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
             }
         }
 
-        // Release taker's order margin for the filled portion
-        // (In Phase 2, this converts to position margin via PositionManager)
-        if (marginUsed > 0) {
+        // When PositionManager is not connected, release taker's margin directly.
+        // When connected, PositionManager handles the margin conversion inside updatePosition.
+        if (marginUsed > 0 && address(positionManager) == address(0)) {
             vault.unlockOrderMargin(trader, marginUsed);
         }
 
@@ -168,33 +175,13 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
             uint256 headId = askHeadAtTick[tick];
 
             while (headId != 0 && remaining > 0) {
-                bytes32 s0 = orderSlot0[headId];
-                address maker = PackedOrder.getOwner(s0);
-                uint256 nextId = nextOrder[headId];
-
-                if (maker == taker) {
-                    headId = nextId;
+                if (PackedOrder.getOwner(orderSlot0[headId]) == taker) {
+                    headId = nextOrder[headId];
                     continue;
                 }
-
-                bytes32 s1 = orderSlot1[headId];
-                uint256 makerSize = PackedOrder.getSize(s1);
-                uint256 fillSize = FixedPointMath.min(remaining, makerSize);
-                uint256 fillPrice = TickMath.tickToPrice(tick, tickSize);
-
-                _executeFill(maker, taker, fillPrice, fillSize, true, headId, takerOrderId);
-                remaining -= fillSize;
-
-                if (fillSize == makerSize) {
-                    _removeOrderFromQueue(headId, true, tick);
-                    headId = nextId;
-                } else {
-                    orderSlot1[headId] = PackedOrder.setSize(s1, makerSize - fillSize);
-                    uint256 makerMargin = orderMarginAmount[headId];
-                    uint256 usedMargin = FixedPointMath.mulDiv(makerMargin, fillSize, makerSize);
-                    orderMarginAmount[headId] -= usedMargin;
-                    break;
-                }
+                bool cont;
+                (remaining, headId, cont) = _fillOneAsk(taker, takerOrderId, tick, headId, remaining);
+                if (!cont) break;
             }
 
             if (askHeadAtTick[tick] == 0) {
@@ -220,33 +207,13 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
             uint256 headId = bidHeadAtTick[tick];
 
             while (headId != 0 && remaining > 0) {
-                bytes32 s0 = orderSlot0[headId];
-                address maker = PackedOrder.getOwner(s0);
-                uint256 nextId = nextOrder[headId];
-
-                if (maker == taker) {
-                    headId = nextId;
+                if (PackedOrder.getOwner(orderSlot0[headId]) == taker) {
+                    headId = nextOrder[headId];
                     continue;
                 }
-
-                bytes32 s1 = orderSlot1[headId];
-                uint256 makerSize = PackedOrder.getSize(s1);
-                uint256 fillSize = FixedPointMath.min(remaining, makerSize);
-                uint256 fillPrice = TickMath.tickToPrice(tick, tickSize);
-
-                _executeFill(maker, taker, fillPrice, fillSize, false, headId, takerOrderId);
-                remaining -= fillSize;
-
-                if (fillSize == makerSize) {
-                    _removeOrderFromQueue(headId, false, tick);
-                    headId = nextId;
-                } else {
-                    orderSlot1[headId] = PackedOrder.setSize(s1, makerSize - fillSize);
-                    uint256 makerMargin = orderMarginAmount[headId];
-                    uint256 usedMargin = FixedPointMath.mulDiv(makerMargin, fillSize, makerSize);
-                    orderMarginAmount[headId] -= usedMargin;
-                    break;
-                }
+                bool cont;
+                (remaining, headId, cont) = _fillOneBid(taker, takerOrderId, tick, headId, remaining);
+                if (!cont) break;
             }
 
             if (bidHeadAtTick[tick] == 0) {
@@ -261,6 +228,54 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         return remaining;
     }
 
+    function _fillOneAsk(address taker, uint256 takerOrderId, uint256 tick, uint256 headId, uint256 remaining)
+        internal
+        returns (uint256 newRemaining, uint256 nextHeadId, bool cont)
+    {
+        bytes32 s1 = orderSlot1[headId];
+        uint256 makerSize = PackedOrder.getSize(s1);
+        uint256 fillSize = FixedPointMath.min(remaining, makerSize);
+        address maker = PackedOrder.getOwner(orderSlot0[headId]);
+        uint256 nextId = nextOrder[headId];
+        uint256 fillPrice = TickMath.tickToPrice(tick, tickSize);
+
+        _executeFill(maker, taker, fillPrice, fillSize, true, headId, takerOrderId);
+        newRemaining = remaining - fillSize;
+
+        if (fillSize == makerSize) {
+            _removeOrderFromQueue(headId, true, tick);
+            return (newRemaining, nextId, true);
+        } else {
+            orderSlot1[headId] = PackedOrder.setSize(s1, makerSize - fillSize);
+            orderMarginAmount[headId] -= FixedPointMath.mulDiv(orderMarginAmount[headId], fillSize, makerSize);
+            return (newRemaining, 0, false);
+        }
+    }
+
+    function _fillOneBid(address taker, uint256 takerOrderId, uint256 tick, uint256 headId, uint256 remaining)
+        internal
+        returns (uint256 newRemaining, uint256 nextHeadId, bool cont)
+    {
+        bytes32 s1 = orderSlot1[headId];
+        uint256 makerSize = PackedOrder.getSize(s1);
+        uint256 fillSize = FixedPointMath.min(remaining, makerSize);
+        address maker = PackedOrder.getOwner(orderSlot0[headId]);
+        uint256 nextId = nextOrder[headId];
+        uint256 fillPrice = TickMath.tickToPrice(tick, tickSize);
+
+        _executeFill(maker, taker, fillPrice, fillSize, false, headId, takerOrderId);
+        newRemaining = remaining - fillSize;
+
+        if (fillSize == makerSize) {
+            _removeOrderFromQueue(headId, false, tick);
+            return (newRemaining, nextId, true);
+        } else {
+            orderSlot1[headId] = PackedOrder.setSize(s1, makerSize - fillSize);
+            orderMarginAmount[headId] -= FixedPointMath.mulDiv(orderMarginAmount[headId], fillSize, makerSize);
+            return (newRemaining, 0, false);
+        }
+    }
+
     function _executeFill(
         address maker,
         address taker,
@@ -270,30 +285,49 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         uint256 makerOrderId,
         uint256 takerOrderId
     ) internal {
-        // Release maker's order margin for the filled portion
-        uint256 makerMargin = orderMarginAmount[makerOrderId];
-        bytes32 s1 = orderSlot1[makerOrderId];
-        uint256 makerTotalSize = PackedOrder.getSize(s1);
-        uint256 makerMarginUsed =
-            (makerTotalSize == size) ? makerMargin : FixedPointMath.mulDiv(makerMargin, size, makerTotalSize);
+        // assembly block prevents Yul IR from inlining this function into the matching loop
+        assembly { }
+        uint256 makerMarginUsed = _computeMakerMarginUsed(makerOrderId, size);
 
-        if (makerMarginUsed > 0) {
-            vault.unlockOrderMargin(maker, makerMarginUsed);
-        }
-
-        // Apply fees
         uint256 notional = FixedPointMath.mulFp(size, price);
         if (makerFeeRate != 0) {
-            int256 makerFee = FixedPointMath.mulFpSigned(int256(notional), makerFeeRate);
-            vault.realizePnl(maker, -makerFee);
+            vault.realizePnl(maker, -FixedPointMath.mulFpSigned(int256(notional), makerFeeRate));
         }
         if (takerFeeRate != 0) {
-            int256 takerFee = FixedPointMath.mulFpSigned(int256(notional), takerFeeRate);
-            vault.realizePnl(taker, -takerFee);
+            vault.realizePnl(taker, -FixedPointMath.mulFpSigned(int256(notional), takerFeeRate));
         }
+
+        _updatePositions(maker, taker, price, size, takerSide, makerMarginUsed);
 
         emit OrderMatched(marketId, makerOrderId, takerOrderId, price, size);
         emit Fill(marketId, maker, taker, price, size, takerSide);
+    }
+
+    function _computeMakerMarginUsed(uint256 makerOrderId, uint256 size) internal view returns (uint256) {
+        uint256 makerMargin = orderMarginAmount[makerOrderId];
+        uint256 makerTotalSize = PackedOrder.getSize(orderSlot1[makerOrderId]);
+        return (makerTotalSize == size) ? makerMargin : FixedPointMath.mulDiv(makerMargin, size, makerTotalSize);
+    }
+
+    function _updatePositions(
+        address maker,
+        address taker,
+        uint256 price,
+        uint256 size,
+        bool takerSide,
+        uint256 makerMarginUsed
+    ) internal {
+        if (address(positionManager) != address(0)) {
+            int256 makerSizeDelta = takerSide ? -int256(size) : int256(size);
+            int256 takerSizeDelta = takerSide ? int256(size) : -int256(size);
+            uint256 takerMarginForFill = marginEngine.getRequiredMargin(marketId, size, price);
+            positionManager.updatePosition(maker, marketId, makerSizeDelta, price, makerMarginUsed);
+            positionManager.updatePosition(taker, marketId, takerSizeDelta, price, takerMarginForFill);
+        } else {
+            if (makerMarginUsed > 0) {
+                vault.unlockOrderMargin(maker, makerMarginUsed);
+            }
+        }
     }
 
     // ─── Internal: Book Management ───
