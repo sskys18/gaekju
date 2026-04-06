@@ -539,7 +539,7 @@ function autoDeleverage(uint256 marketId, address bankruptAccount) external;
 struct FundingState {
     int256 cumulativeFundingRate;  // accumulated funding rate (18 dec)
     uint256 lastFundingTime;       // last update timestamp
-    uint256 fundingInterval;       // 8 hours = 28800 seconds
+    uint256 fundingInterval;       // 1 hour = 3600 seconds (matches Lighter)
     int256 maxFundingRate;         // e.g., 1e15 = 0.1%
 }
 
@@ -1475,26 +1475,66 @@ fundingPayment = mulFp(mulFp(positionSize, fundingDelta), markPrice)
 
 ## 9. Market Configurations
 
+All markets are mirrored from Lighter.xyz. Leverage and margin configs follow Lighter's specs with Gaekju-specific adjustments.
+
 ### Crypto Perpetuals
 
-| Market | Max Leverage | IMR | MMR | Tick Size | Lot Size | Max Funding Rate |
-|--------|-------------|-----|-----|-----------|----------|-----------------|
-| BTC-USD | 50x | 2% | 1% | $0.10 | 0.001 BTC | 0.1% / 8h |
-| ETH-USD | 50x | 2% | 1% | $0.01 | 0.01 ETH | 0.1% / 8h |
-| SOL-USD | 20x | 5% | 2.5% | $0.001 | 0.1 SOL | 0.1% / 8h |
-| OP-USD | 20x | 5% | 2.5% | $0.0001 | 1 OP | 0.1% / 8h |
-| ARB-USD | 20x | 5% | 2.5% | $0.0001 | 1 ARB | 0.1% / 8h |
-| DOGE-USD | 10x | 10% | 5% | $0.00001 | 100 DOGE | 0.1% / 8h |
+| Market | Max Leverage | IMR | MMR | Tick Size | Lot Size | Funding |
+|--------|-------------|-----|-----|-----------|----------|---------|
+| BTC-USD | 50x | 2% | 1.2% | $0.10 | 0.00001 BTC | 1h |
+| ETH-USD | 50x | 2% | 1.2% | $0.01 | 0.0001 ETH | 1h |
+| SOL-USD | 25x | 4% | 2.4% | $0.001 | 0.001 SOL | 1h |
+| OP-USD | 20x | 5% | 3% | $0.0001 | 0.1 OP | 1h |
+| ARB-USD | 20x | 5% | 3% | $0.0001 | 0.1 ARB | 1h |
+| DOGE-USD | 20x | 5% | 3% | $0.00001 | 1 DOGE | 1h |
+| + 50 more crypto pairs | varies | varies | varies | varies | varies | 1h |
 
-### RWA Perpetuals
+### Korean Market Perpetuals (KRW-quoted)
 
-| Market | Max Leverage | IMR | MMR | Tick Size | Lot Size | Max Funding Rate |
-|--------|-------------|-----|-----|-----------|----------|-----------------|
-| EUR-USD | 10x | 10% | 5% | $0.0001 | 100 EUR | 0.05% / 8h |
-| GBP-USD | 10x | 10% | 5% | $0.0001 | 100 GBP | 0.05% / 8h |
-| XAU-USD | 10x | 10% | 5% | $0.01 | 0.01 oz | 0.05% / 8h |
-| XAG-USD | 10x | 10% | 5% | $0.001 | 1 oz | 0.05% / 8h |
-| SPX-USD | 5x | 20% | 10% | $0.01 | 0.01 units | 0.05% / 8h |
+| Market | Max Leverage | IMR | MMR | Tick Size | Lot Size | Funding |
+|--------|-------------|-----|-----|-----------|----------|---------|
+| KRCOMP (KRX Index) | 10x | 10% | 6% | ₩10 | 0.01 units | 1h |
+| SAMSUNG | 10x | 10% | 6% | ₩100 | 0.01 shares | 1h |
+| SKHYNIX | 10x | 10% | 6% | ₩100 | 0.01 shares | 1h |
+| HYUNDAI | 10x | 10% | 6% | ₩100 | 0.01 shares | 1h |
+| HANMI | 10x | 10% | 6% | ₩10 | 0.1 shares | 1h |
+
+### US Equity & Index Perpetuals
+
+| Market | Max Leverage | IMR | MMR | Tick Size | Lot Size | Funding |
+|--------|-------------|-----|-----|-----------|----------|---------|
+| SPY (S&P 500) | 10x | 10% | 6% | $0.01 | 0.01 units | 1h |
+| QQQ (Nasdaq-100) | 10x | 10% | 6% | $0.01 | 0.01 units | 1h |
+| DIA (Dow Jones) | 10x | 10% | 6% | $0.01 | 0.01 units | 1h |
+| IWM (Russell 2000) | 10x | 10% | 6% | $0.01 | 0.01 units | 1h |
+| MAGS (Mag 7 ETF) | 10x | 10% | 6% | $0.01 | 0.01 units | 1h |
+| BOTZ (Robotics/AI) | 10x | 10% | 6% | $0.01 | 0.01 units | 1h |
+
+### Forex Perpetuals
+
+| Market | Max Leverage | IMR | MMR | Tick Size | Lot Size | Funding |
+|--------|-------------|-----|-----|-----------|----------|---------|
+| EUR-USD | 25x | 4% | 2.4% | $0.0001 | 100 EUR | 1h |
+| USD-KRW | 25x | 4% | 2.4% | ₩0.1 | 1000 USD | 1h |
+| USD-JPY | 25x | 4% | 2.4% | ¥0.01 | 1000 USD | 1h |
+| GBP-USD | 25x | 4% | 2.4% | $0.0001 | 100 GBP | 1h |
+| USD-CHF | 25x | 4% | 2.4% | CHF0.0001 | 1000 USD | 1h |
+| NZD-USD | 25x | 4% | 2.4% | $0.0001 | 100 NZD | 1h |
+
+### Commodity Perpetuals
+
+| Market | Max Leverage | IMR | MMR | Tick Size | Lot Size | Funding |
+|--------|-------------|-----|-----|-----------|----------|---------|
+| XAU (Gold) | 10x | 10% | 6% | $0.01 | 0.01 oz | 1h |
+| XAG (Silver) | 10x | 10% | 6% | $0.001 | 1 oz | 1h |
+| COPPER | 10x | 10% | 6% | $0.001 | 1 lb | 1h |
+| PLATINUM | 10x | 10% | 6% | $0.01 | 0.01 oz | 1h |
+| PALLADIUM | 10x | 10% | 6% | $0.01 | 0.01 oz | 1h |
+| WTI (Crude Oil) | 10x | 10% | 6% | $0.01 | 0.1 bbl | 1h |
+| NATGAS | 10x | 10% | 6% | $0.001 | 1 MMBtu | 1h |
+| BRENT | 10x | 10% | 6% | $0.01 | 0.1 bbl | 1h |
+
+**Total: ~80+ markets at launch** (all mirrored from Lighter, more added by config)
 
 ---
 
