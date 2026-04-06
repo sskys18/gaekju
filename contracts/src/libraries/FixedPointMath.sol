@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 
 library FixedPointMath {
     uint256 internal constant ONE = 1e18;

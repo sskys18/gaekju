@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {Test} from "forge-std/Test.sol";
-import {MarginEngine} from "../../src/MarginEngine.sol";
-import {Vault} from "../../src/Vault.sol";
-import {OracleAdapter} from "../../src/OracleAdapter.sol";
-import {MockERC20} from "../mocks/MockERC20.sol";
-import {MockPyth} from "../mocks/MockPyth.sol";
-import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {IMarginEngine} from "../../src/interfaces/IMarginEngine.sol";
+import { Test } from "forge-std/Test.sol";
+import { MarginEngine } from "../../src/MarginEngine.sol";
+import { Vault } from "../../src/Vault.sol";
+import { OracleAdapter } from "../../src/OracleAdapter.sol";
+import { MockERC20 } from "../mocks/MockERC20.sol";
+import { MockPyth } from "../mocks/MockPyth.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import { IMarginEngine } from "../../src/interfaces/IMarginEngine.sol";
 
 contract MarginEngineTest is Test {
     MarginEngine public engine;
@@ -27,9 +27,7 @@ contract MarginEngineTest is Test {
         mockPyth = new MockPyth();
 
         vault = Vault(
-            address(
-                new ERC1967Proxy(address(new Vault()), abi.encodeCall(Vault.initialize, (address(usdc), admin)))
-            )
+            address(new ERC1967Proxy(address(new Vault()), abi.encodeCall(Vault.initialize, (address(usdc), admin))))
         );
 
         oracle = OracleAdapter(

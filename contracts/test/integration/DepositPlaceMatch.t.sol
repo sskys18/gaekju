@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {Test} from "forge-std/Test.sol";
-import {Vault} from "../../src/Vault.sol";
-import {OrderBook} from "../../src/OrderBook.sol";
-import {MarginEngine} from "../../src/MarginEngine.sol";
-import {OracleAdapter} from "../../src/OracleAdapter.sol";
-import {MockERC20} from "../mocks/MockERC20.sol";
-import {MockPyth} from "../mocks/MockPyth.sol";
-import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {IMarginEngine} from "../../src/interfaces/IMarginEngine.sol";
+import { Test } from "forge-std/Test.sol";
+import { Vault } from "../../src/Vault.sol";
+import { OrderBook } from "../../src/OrderBook.sol";
+import { MarginEngine } from "../../src/MarginEngine.sol";
+import { OracleAdapter } from "../../src/OracleAdapter.sol";
+import { MockERC20 } from "../mocks/MockERC20.sol";
+import { MockPyth } from "../mocks/MockPyth.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import { IMarginEngine } from "../../src/interfaces/IMarginEngine.sol";
 
 contract DepositPlaceMatchTest is Test {
     Vault public vault;
@@ -31,9 +31,7 @@ contract DepositPlaceMatchTest is Test {
         mockPyth = new MockPyth();
 
         vault = Vault(
-            address(
-                new ERC1967Proxy(address(new Vault()), abi.encodeCall(Vault.initialize, (address(usdc), admin)))
-            )
+            address(new ERC1967Proxy(address(new Vault()), abi.encodeCall(Vault.initialize, (address(usdc), admin))))
         );
 
         oracle = OracleAdapter(
@@ -57,9 +55,7 @@ contract DepositPlaceMatchTest is Test {
             address(
                 new ERC1967Proxy(
                     address(new OrderBook()),
-                    abi.encodeCall(
-                        OrderBook.initialize, (MARKET_ID, address(vault), address(engine), TICK_SIZE, admin)
-                    )
+                    abi.encodeCall(OrderBook.initialize, (MARKET_ID, address(vault), address(engine), TICK_SIZE, admin))
                 )
             )
         );

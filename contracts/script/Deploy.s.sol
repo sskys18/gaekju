@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {Script, console} from "forge-std/Script.sol";
-import {Vault} from "../src/Vault.sol";
-import {OracleAdapter} from "../src/OracleAdapter.sol";
-import {MarginEngine} from "../src/MarginEngine.sol";
-import {OrderBook} from "../src/OrderBook.sol";
-import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {IMarginEngine} from "../src/interfaces/IMarginEngine.sol";
+import { Script, console } from "forge-std/Script.sol";
+import { Vault } from "../src/Vault.sol";
+import { OracleAdapter } from "../src/OracleAdapter.sol";
+import { MarginEngine } from "../src/MarginEngine.sol";
+import { OrderBook } from "../src/OrderBook.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import { IMarginEngine } from "../src/interfaces/IMarginEngine.sol";
 
 contract Deploy is Script {
     function run() external {
@@ -19,9 +19,7 @@ contract Deploy is Script {
         vm.startBroadcast(deployerPk);
 
         Vault vault = Vault(
-            address(
-                new ERC1967Proxy(address(new Vault()), abi.encodeCall(Vault.initialize, (usdc, deployer)))
-            )
+            address(new ERC1967Proxy(address(new Vault()), abi.encodeCall(Vault.initialize, (usdc, deployer))))
         );
 
         OracleAdapter oracle = OracleAdapter(
@@ -47,9 +45,7 @@ contract Deploy is Script {
             address(
                 new ERC1967Proxy(
                     address(new OrderBook()),
-                    abi.encodeCall(
-                        OrderBook.initialize, (0, address(vault), address(engine), btcTickSize, deployer)
-                    )
+                    abi.encodeCall(OrderBook.initialize, (0, address(vault), address(engine), btcTickSize, deployer))
                 )
             )
         );

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {IOrderBook} from "./interfaces/IOrderBook.sol";
-import {IVault} from "./interfaces/IVault.sol";
-import {BitmapLib} from "./libraries/BitmapLib.sol";
-import {FixedPointMath} from "./libraries/FixedPointMath.sol";
-import {PackedOrder} from "./libraries/PackedOrder.sol";
-import {TickMath} from "./libraries/TickMath.sol";
+import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import { AccessControlUpgradeable } from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { IOrderBook } from "./interfaces/IOrderBook.sol";
+import { IVault } from "./interfaces/IVault.sol";
+import { BitmapLib } from "./libraries/BitmapLib.sol";
+import { FixedPointMath } from "./libraries/FixedPointMath.sol";
+import { PackedOrder } from "./libraries/PackedOrder.sol";
+import { TickMath } from "./libraries/TickMath.sol";
 
 interface IMarginEngineForOB {
     function getRequiredMargin(uint256 marketId, uint256 size, uint256 price) external view returns (uint256);
@@ -62,13 +62,10 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
 
     uint256[50] private __gap;
 
-    function initialize(
-        uint256 _marketId,
-        address _vault,
-        address _marginEngine,
-        uint256 _tickSize,
-        address _admin
-    ) external initializer {
+    function initialize(uint256 _marketId, address _vault, address _marginEngine, uint256 _tickSize, address _admin)
+        external
+        initializer
+    {
         __AccessControl_init();
         marketId = _marketId;
         vault = IVault(_vault);
@@ -501,5 +498,5 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         return 0;
     }
 
-    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
+    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) { }
 }

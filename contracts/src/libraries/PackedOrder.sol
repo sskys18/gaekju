@@ -14,14 +14,11 @@ library PackedOrder {
     }
 
     function pack(Order memory order) internal pure returns (bytes32 slot0, bytes32 slot1) {
-        uint8 flags =
-            (order.side ? 1 : 0) | (uint8(order.orderType & 0x07) << 1) | (order.reduceOnly ? 1 << 4 : 0);
+        uint8 flags = (order.side ? 1 : 0) | (uint8(order.orderType & 0x07) << 1) | (order.reduceOnly ? 1 << 4 : 0);
 
         slot0 = bytes32(
-            uint256(uint160(order.owner)) |
-                (uint256(order.orderId) << 160) |
-                (uint256(order.timestamp) << 192) |
-                (uint256(flags) << 224)
+            uint256(uint160(order.owner)) | (uint256(order.orderId) << 160) | (uint256(order.timestamp) << 192)
+                | (uint256(flags) << 224)
         );
 
         slot1 = bytes32(uint256(uint128(order.price)) | (uint256(uint128(order.size)) << 128));

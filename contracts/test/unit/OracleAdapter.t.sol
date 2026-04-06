@@ -4,7 +4,7 @@ pragma solidity ^0.8.28;
 import "forge-std/Test.sol";
 import "../../src/OracleAdapter.sol";
 import "../mocks/MockPyth.sol";
-import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 contract OracleAdapterTest is Test {
     OracleAdapter public oracle;

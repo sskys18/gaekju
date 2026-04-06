@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
-import {IMarginEngine} from "./interfaces/IMarginEngine.sol";
-import {IVault} from "./interfaces/IVault.sol";
-import {IOracleAdapter} from "./interfaces/IOracleAdapter.sol";
-import {FixedPointMath} from "./libraries/FixedPointMath.sol";
-import {TickMath} from "./libraries/TickMath.sol";
+import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import { AccessControlUpgradeable } from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import { IMarginEngine } from "./interfaces/IMarginEngine.sol";
+import { IVault } from "./interfaces/IVault.sol";
+import { IOracleAdapter } from "./interfaces/IOracleAdapter.sol";
+import { FixedPointMath } from "./libraries/FixedPointMath.sol";
+import { TickMath } from "./libraries/TickMath.sol";
 
 contract MarginEngine is IMarginEngine, UUPSUpgradeable, AccessControlUpgradeable {
     error OrderTooSmall();
@@ -90,5 +90,5 @@ contract MarginEngine is IMarginEngine, UUPSUpgradeable, AccessControlUpgradeabl
         if (!TickMath.isAligned(price, c.tickSize)) revert PriceNotAligned();
     }
 
-    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
+    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) { }
 }

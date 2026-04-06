@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
-import {IOracleAdapter} from "./interfaces/IOracleAdapter.sol";
-import {IOrderBook} from "./interfaces/IOrderBook.sol";
-import {FixedPointMath} from "./libraries/FixedPointMath.sol";
-import {TickMath} from "./libraries/TickMath.sol";
+import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import { AccessControlUpgradeable } from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import { IOracleAdapter } from "./interfaces/IOracleAdapter.sol";
+import { IOrderBook } from "./interfaces/IOrderBook.sol";
+import { FixedPointMath } from "./libraries/FixedPointMath.sol";
+import { TickMath } from "./libraries/TickMath.sol";
 
 interface IMockPyth {
     struct PriceData {
@@ -47,7 +47,10 @@ contract OracleAdapter is IOracleAdapter, UUPSUpgradeable, AccessControlUpgradea
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
     }
 
-    function setMarketOracle(uint256 marketId, bytes32 pythPriceId, uint256 stalenessThreshold) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setMarketOracle(uint256 marketId, bytes32 pythPriceId, uint256 stalenessThreshold)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
         marketOracles[marketId] = MarketOracle(pythPriceId, stalenessThreshold);
     }
 
@@ -90,7 +93,7 @@ contract OracleAdapter is IOracleAdapter, UUPSUpgradeable, AccessControlUpgradea
 
     function updatePrice(uint256 marketId, bytes[] calldata priceUpdateData) external payable {
         uint256 fee = pyth.getUpdateFee(priceUpdateData);
-        pyth.updatePriceFeeds{value: fee}(priceUpdateData);
+        pyth.updatePriceFeeds{ value: fee }(priceUpdateData);
         emit PriceUpdated(marketId, _getOraclePrice(marketId), block.timestamp);
     }
 
@@ -126,5 +129,5 @@ contract OracleAdapter is IOracleAdapter, UUPSUpgradeable, AccessControlUpgradea
         }
     }
 
-    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
+    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) { }
 }
