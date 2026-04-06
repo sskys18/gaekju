@@ -3,7 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
+    paths:
+      - 'contracts/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
   pull_request:
+    paths:
+      - 'contracts/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 
 env:
   FOUNDRY_PROFILE: default
