@@ -5,6 +5,7 @@ Cargo.lock
 # Foundry
 contracts/out/
 contracts/cache/
+contracts/lib/
 
 # Node
 node_modules/
