@@ -332,6 +332,23 @@ tryMatch(side, limitPrice, size):
   return size - remaining  // total matched
 ```
 
+#### Fee Model
+
+```solidity
+struct FeeConfig {
+    int256 makerFeeRate;    // -1e14 = -0.01% (negative = rebate)
+    int256 takerFeeRate;    //  5e14 = +0.05%
+}
+
+// Applied on each fill inside executeFill():
+//   notional = mulFp(fillSize, fillPrice)
+//   makerFee = mulFp(notional, makerFeeRate)  // negative → maker receives
+//   takerFee = mulFp(notional, takerFeeRate)  // positive → taker pays
+//   vault.realizePnl(maker, -makerFee)
+//   vault.realizePnl(taker, -takerFee)
+//   protocolRevenue += takerFee + makerFee    // always net positive
+```
+
 #### Events
 
 ```solidity
@@ -1524,169 +1541,568 @@ fundingPayment = mulFp(mulFp(positionSize, fundingDelta), markPrice)
 
 ---
 
-## 11. Simulated Trading & Market Making
+## 11. Live Market Operations — From Empty Book to Active Exchange
 
-### 11.1 Why Simulated Trades
+This section covers the full lifecycle of how Gaekju creates a live trading experience: how a single order becomes a fill, how liquidity appears, and how the testnet feels like a real exchange.
 
-A new perp DEX with an empty orderbook is unusable. Real traders won't trade if there's no liquidity, and there's no liquidity without traders. To solve this cold-start problem, Gaekju runs **simulated market maker bots** that:
+### 11.1 How a Trade Actually Happens (End-to-End)
 
-1. Provide continuous liquidity (tight bid/ask spreads)
-2. Generate realistic trading activity (volume, price movement)
-3. Respond to oracle price changes (track Pyth feeds)
-4. Interact with real users seamlessly (real users trade against bot orders)
-5. Create a natural-looking orderbook that attracts organic traders
+Here's every step from a trader's click to their position appearing on screen.
 
-### 11.2 Bot Architecture
+#### Step 1: Trader Prepares
+
+```
+Trader has:
+  - Wallet connected to Giwa L2
+  - USDC deposited in Vault (already on-chain)
+  - Free margin available (not locked by other positions/orders)
+```
+
+#### Step 2: Order Submission
+
+```
+Trader wants: Buy 0.1 BTC-PERP at market
+
+Frontend/SDK:
+  1. Read current best ask from API (WebSocket): $60,000.50
+  2. Build transaction: Router.placeOrder(
+       marketId: 0,          // BTC-USD
+       side: true,           // buy
+       price: 0,             // market order (no price limit)
+       size: 0.1e18,         // 0.1 BTC in 18-decimal
+       orderType: MARKET
+     )
+  3. Sign transaction with wallet
+  4. Submit to Giwa L2 RPC endpoint
+
+Timeline: ~50-200ms (wallet signing + RPC submission)
+```
+
+#### Step 3: Transaction Hits the Sequencer
+
+```
+Giwa L2 Sequencer:
+  1. Receives the transaction
+  2. Orders it (FCFS within block, ~2s block time on OP Stack)
+  3. Executes the transaction in the EVM
+
+  What happens inside the EVM in ONE transaction:
+  ┌─────────────────────────────────────────────────────┐
+  │ Router.placeOrder()                                  │
+  │  ├─ MarginEngine.checkInitialMargin()               │
+  │  │   └─ Verify: free margin >= 0.1 * $60,000 / 50x │
+  │  │       = $120 required margin ✓                    │
+  │  │                                                    │
+  │  ├─ OrderBook.placeOrder(MARKET, BUY, 0.1)          │
+  │  │   ├─ Walk the ask side from bestAskTick           │
+  │  │   │                                                │
+  │  │   │  Ask book state:                               │
+  │  │   │  ┌─────────────────────────────────────┐      │
+  │  │   │  │ $60,000.50  0.05 BTC  (Maker A)    │ ← fill│
+  │  │   │  │ $60,000.60  0.03 BTC  (Maker B)    │ ← fill│
+  │  │   │  │ $60,000.70  0.10 BTC  (Maker C)    │ ← partial│
+  │  │   │  │ $60,001.00  0.20 BTC  (Maker D)    │      │
+  │  │   │  └─────────────────────────────────────┘      │
+  │  │   │                                                │
+  │  │   ├─ Fill 1: 0.05 BTC @ $60,000.50 vs Maker A   │
+  │  │   ├─ Fill 2: 0.03 BTC @ $60,000.60 vs Maker B   │
+  │  │   ├─ Fill 3: 0.02 BTC @ $60,000.70 vs Maker C   │
+  │  │   │  (Maker C has 0.08 remaining)                 │
+  │  │   │                                                │
+  │  │   ├─ For each fill:                               │
+  │  │   │   ├─ Vault.unlockOrderMargin(maker)           │
+  │  │   │   ├─ PositionManager.updatePosition(taker)    │
+  │  │   │   ├─ PositionManager.updatePosition(maker)    │
+  │  │   │   └─ emit Fill(market, maker, taker, price, size) │
+  │  │   │                                                │
+  │  │   └─ Update bestAskTick to $60,000.70             │
+  │  │                                                    │
+  │  └─ Taker's final state:                             │
+  │      Position: LONG 0.1 BTC                          │
+  │      Avg entry: $60,000.56 (weighted average)        │
+  │      Locked margin: $120                              │
+  │      3 Fill events emitted                            │
+  └─────────────────────────────────────────────────────┘
+
+Gas cost: ~200-400k gas (3 fills + state updates)
+L2 cost: ~$0.01-0.05 at typical OP Stack gas prices
+Block confirmation: ~2 seconds
+```
+
+#### Step 4: Events Propagate
+
+```
+On-chain events emitted in the transaction receipt:
+
+  Fill(marketId=0, maker=MakerA, taker=Trader, price=60000.50e18, size=0.05e18, takerSide=BUY)
+  Fill(marketId=0, maker=MakerB, taker=Trader, price=60000.60e18, size=0.03e18, takerSide=BUY)
+  Fill(marketId=0, maker=MakerC, taker=Trader, price=60000.70e18, size=0.02e18, takerSide=BUY)
+  OrderMatched(marketId=0, makerOrderId=42, takerOrderId=0, price=60000.50e18, size=0.05e18)
+  OrderMatched(marketId=0, makerOrderId=43, takerOrderId=0, price=60000.60e18, size=0.03e18)
+  OrderMatched(marketId=0, makerOrderId=44, takerOrderId=0, price=60000.70e18, size=0.02e18)
+  PositionUpdated(account=Trader, marketId=0, size=0.1e18, entryPrice=60000.56e18)
+
+Indexer picks up these events within ~1 second of block confirmation.
+```
+
+#### Step 5: User Sees the Result
+
+```
+API Server (fed by Indexer):
+
+  WebSocket push to Trader's frontend:
+    {"channel": "orders", "data": {"status": "filled", "avgPrice": "60000.56", "fills": 3}}
+    {"channel": "positions", "data": {"market": 0, "side": "long", "size": "0.1", "entry": "60000.56"}}
+
+  WebSocket push to ALL subscribers of orderbook:BTC-USD:
+    {"channel": "orderbook", "data": {"asks": [["60000.70", "0.08"], ["60001.00", "0.20"], ...], "seq": 456}}
+
+  WebSocket push to ALL subscribers of trades:BTC-USD:
+    {"channel": "trades", "data": [
+      {"price": "60000.50", "size": "0.05", "side": "buy", "time": 1712419200},
+      {"price": "60000.60", "size": "0.03", "side": "buy", "time": 1712419200},
+      {"price": "60000.70", "size": "0.02", "side": "buy", "time": 1712419200}
+    ]}
+
+Total latency (submit → see result): ~2-4 seconds
+  - 50-200ms: signing + RPC submission
+  - ~2s: block inclusion
+  - ~500ms: indexer processes + API pushes
+```
+
+#### Full Timeline Comparison
+
+```
+              Gaekju (on-chain)        Hyperliquid (off-chain)      Binance (CEX)
+Submit        50-200ms                 1-5ms                         1-5ms
+Match         ~2s (next block)         ~1ms (in-memory)              ~1ms
+Confirm       ~2s (L2 block)           ~1s (HyperBFT)                instant
+See result    ~3-4s total              ~1-2s total                   ~50ms total
+Settlement    instant (on-chain)       batched to L1                 internal ledger
+Trust         trustless (L2)           trust operator                trust exchange
+```
+
+### 11.2 Liquidity — Where Do Fills Come From?
+
+On an empty exchange, there's nobody on the other side of your trade. Here's how a live market builds liquidity layer by layer:
+
+#### Layer 1: Designated Market Makers (DMMs)
+
+Professional or semi-professional market makers who commit to providing continuous liquidity.
+
+```
+How a market maker works on Gaekju:
+
+  MM has: 500,000 USDC deposited in Vault
+  MM runs: gaekju-sdk based bot on a server
+
+  Every block (~2s), the MM bot:
+    1. Reads Pyth oracle price: BTC = $60,000
+    2. Reads current inventory: net long 0.3 BTC from previous fills
+    3. Calculates fair value: $60,000 (oracle) adjusted for inventory risk
+    4. Sets quotes:
+
+       BID SIDE (where MM buys):                ASK SIDE (where MM sells):
+       $59,997  0.05 BTC  (3 bps below mid)     $60,003  0.05 BTC  (3 bps above mid)
+       $59,994  0.05 BTC  (6 bps)               $60,006  0.05 BTC  (6 bps)
+       $59,991  0.10 BTC  (9 bps)               $60,009  0.10 BTC  (9 bps)
+       $59,985  0.10 BTC  (15 bps)              $60,015  0.10 BTC  (15 bps)
+       $59,970  0.20 BTC  (30 bps)              $60,030  0.20 BTC  (30 bps)
+       ─────────────────────                     ─────────────────────
+       Total: 0.50 BTC bid depth                 Total: 0.50 BTC ask depth
+
+    5. Since MM is long 0.3 BTC, skew quotes:
+       - Tighten ask spread (want to sell, reduce inventory)
+       - Widen bid spread (less eager to buy more)
+       - Adjusted: bids 5bps wider, asks 2bps tighter
+
+    6. Cancel old orders, place new batch: Router.batchPlaceOrders()
+
+  When a retail trader market-buys 0.1 BTC:
+    - Fills against MM's ask at $60,003 and $60,006
+    - MM is now long 0.4 BTC (inventory increased)
+    - Next refresh: MM skews quotes further to shed inventory
+    - MM profits from the spread ($60,003 - $59,997 = $6/BTC = 1 bps)
+
+  Revenue model for MM:
+    spread capture - inventory risk - gas costs - funding payments = profit
+    On testnet: MM bots run at break-even, purpose is liquidity not profit
+```
+
+#### Layer 2: Fee Incentives for Makers
+
+How real exchanges attract market makers:
+
+```
+Fee structure (maker-taker model):
+  ┌──────────────────────────────────────────────────┐
+  │  Maker fee:  -0.01% (REBATE — makers get PAID)   │
+  │  Taker fee:  +0.05%                               │
+  │                                                    │
+  │  A maker placing a limit order that rests on the   │
+  │  book EARNS 0.01% of the fill notional when it     │
+  │  gets filled. Takers pay 0.05%.                    │
+  │                                                    │
+  │  Net protocol revenue: 0.04% per trade             │
+  └──────────────────────────────────────────────────┘
+
+  Example: 0.1 BTC trade at $60,000 = $6,000 notional
+    Taker pays:  $6,000 * 0.05% = $3.00
+    Maker earns: $6,000 * 0.01% = $0.60
+    Protocol:    $3.00 - $0.60 = $2.40
+
+  This incentivizes anyone to place limit orders — you get paid for providing liquidity.
+```
+
+Implementation in contracts:
+
+```solidity
+// In OrderBook, on each fill:
+struct FeeConfig {
+    int256 makerFeeRate;    // -1e14 = -0.01% (negative = rebate)
+    int256 takerFeeRate;    // 5e14  = +0.05%
+}
+
+// On fill execution:
+notional = mulFp(fillSize, fillPrice)
+makerFee = mulFp(notional, makerFeeRate)  // negative = rebate to maker
+takerFee = mulFp(notional, takerFeeRate)  // positive = charge taker
+
+vault.realizePnl(maker, -makerFee)  // maker receives rebate
+vault.realizePnl(taker, -takerFee)  // taker pays fee
+protocolRevenue += takerFee + makerFee  // net positive
+```
+
+#### Layer 3: Organic Traders
+
+Once there's a visible orderbook with tight spreads and some trading activity, organic traders arrive:
+
+```
+Organic trader attraction funnel:
+
+  1. Trader visits Gaekju → sees BTC-USD orderbook
+  2. Sees: tight spread (6 bps), deep book (0.5 BTC each side)
+  3. Sees: recent trades happening every few seconds
+  4. Sees: price tracking Binance/real market within a few bps
+  5. Thinks: "this looks legit, I can trade here"
+  6. Deposits testnet USDC from faucet
+  7. Places first trade → gets filled instantly against MM orders
+  8. Their limit orders add to the book → more liquidity
+  9. Flywheel: more liquidity → tighter spreads → more traders
+```
+
+### 11.3 Making the Testnet Feel Like a Real Exchange
+
+The challenge: on testnet, money isn't real, so behavior is weird. Here's how to create realistic conditions:
+
+#### Price Feed Realism
+
+```
+Gaekju prices track REAL market prices because we use Pyth oracle:
+
+  Pyth BTC/USD feed → real Binance/Coinbase/Kraken aggregated price
+    ↓
+  OracleAdapter.getIndexPrice() → $60,000.00 (real world price)
+    ↓
+  Mark price blend → 70% oracle + 30% orderbook mid
+    ↓
+  Displayed price on Gaekju ≈ real BTC price ± a few bps
+
+  Result: Gaekju chart looks like a real BTC chart.
+  Price discovery is real. Only the USDC is testnet.
+```
+
+#### Orderbook Depth Realism
+
+How to make the book look like Binance, not like a dead testnet:
+
+```
+Target book state (BTC-USD):
+
+  ASKS                              BIDS
+  $60,030.00   0.50 BTC            $59,970.00   0.50 BTC
+  $60,020.00   0.30 BTC            $59,980.00   0.30 BTC
+  $60,015.00   0.20 BTC            $59,985.00   0.20 BTC
+  $60,010.00   0.10 BTC            $59,990.00   0.10 BTC
+  $60,006.00   0.05 BTC ← MM      $59,994.00   0.05 BTC ← MM
+  $60,003.00   0.05 BTC ← MM      $59,997.00   0.05 BTC ← MM
+  ──────────── spread: $6 (1 bps) ────────────
+
+  Sources of this depth:
+  ├─ MM bot: inner 2-3 levels (tight, always refreshed)
+  ├─ Grid bot: outer levels (passive, wider spacing)
+  └─ Organic limit orders: anywhere (from real users)
+
+  Key: the book ALWAYS has something to trade against.
+  A market buy of 0.5 BTC would cost ~$60,015 avg (2.5 bps slippage).
+  This is realistic for a mid-tier exchange.
+```
+
+#### Trade Flow Realism
+
+A realistic exchange has varied trade patterns. Here's the target:
+
+```
+Trade pattern over 1 hour (BTC-USD):
+
+  Minute 0-5:   quiet, 2-3 small trades/min (organic browsing)
+  Minute 5-10:  BTC moves 0.5%, flurry of 8-10 trades/min
+  Minute 10-15: cooling off, 3-4 trades/min
+  Minute 15-20: large order hits, 0.5 BTC trade, MM rebalances
+  Minute 20-30: steady, 4-6 trades/min
+  Minute 30-35: another price move, liquidation triggers
+  Minute 35-60: steady background activity
+
+  This comes from:
+  ├─ MM bot requoting every block (creates matched trades when price moves)
+  ├─ Simulation bots (configurable trade frequency and patterns)
+  └─ Organic traders (unpredictable, adds genuine randomness)
+```
+
+#### Slippage Realism
+
+```
+Slippage by order size (BTC-USD, target):
+
+  Size          Slippage     Comparable to
+  0.01 BTC      <1 bps       Binance large-cap
+  0.1 BTC       2-5 bps      Binance mid-cap
+  0.5 BTC       10-20 bps    dYdX / Hyperliquid
+  1.0 BTC       30-50 bps    smaller CEX
+  5.0 BTC       100+ bps     thin market
+
+  Controlled by:
+  ├─ MM depth per level (sizePerLevel config)
+  ├─ Number of levels (numLevels config)
+  └─ Grid bot density
+```
+
+### 11.4 The Simulation Engine (`gaekju-bots`)
 
 ```
 crates/
-└── gaekju-bots/            # Market making + simulation bots
+└── gaekju-bots/
     ├── src/
-    │   ├── main.rs
-    │   ├── market_maker.rs  # Core MM strategy
-    │   ├── simulator.rs     # Simulated trader behaviors
-    │   ├── oracle_tracker.rs # Track Pyth prices for fair value
-    │   ├── inventory.rs     # Manage bot inventory / risk
-    │   ├── config.rs        # Bot configuration
-    │   └── strategies/
+    │   ├── main.rs              # Run all bots as one process
+    │   ├── config.rs            # TOML config loader
+    │   ├── engine.rs            # Core simulation loop
+    │   │
+    │   ├── market_maker/
+    │   │   ├── mod.rs
+    │   │   ├── quoting.rs       # Bid/ask price calculation
+    │   │   ├── inventory.rs     # Inventory tracking + skew
+    │   │   ├── hedging.rs       # Cross-market hedging (optional)
+    │   │   └── oracle.rs        # Pyth price tracking + TWAP
+    │   │
+    │   ├── simulation/
+    │   │   ├── mod.rs
+    │   │   ├── persona.rs       # Trader personality definitions
+    │   │   ├── scheduler.rs     # When to trade (Poisson process)
+    │   │   ├── sizing.rs        # How much to trade (log-normal)
+    │   │   └── decision.rs      # Buy/sell/hold logic per persona
+    │   │
+    │   ├── grid/
+    │   │   ├── mod.rs
+    │   │   └── rebalancer.rs    # Grid order management
+    │   │
+    │   └── monitoring/
     │       ├── mod.rs
-    │       ├── grid.rs      # Grid market making
-    │       ├── avellaneda.rs # Avellaneda-Stoikov MM
-    │       └── noise.rs     # Random noise traders
-    └── Cargo.toml
+    │       ├── pnl.rs           # Track each bot's PnL
+    │       ├── metrics.rs       # Prometheus metrics for bot health
+    │       └── alerts.rs        # Alert if bot hits risk limits
+    │
+    └── config/
+        ├── default.toml         # Default configs
+        ├── btc-usd.toml         # BTC market-specific overrides
+        └── eth-usd.toml
 ```
 
-### 11.3 Bot Types
+Bot config example (`config/default.toml`):
 
-#### Market Maker Bot (Primary)
-Provides continuous two-sided liquidity around the oracle price.
+```toml
+[market_maker]
+enabled = true
+spread_bps = 10
+num_levels = 5
+size_per_level = "0.05"     # BTC
+refresh_interval_ms = 2000   # every block
+max_inventory = "2.0"        # max 2 BTC net position
+skew_factor = "0.5"          # how aggressively to skew quotes
+oracle_weight = 0.7          # mark price blend
+initial_usdc = "500000"
 
-```
-Strategy: Avellaneda-Stoikov market making (adapted for on-chain)
+[simulation]
+enabled = true
+num_personas = 20
 
-Config per market:
-  spreadBps:       10-50 bps (tighter for BTC/ETH, wider for altcoins/RWA)
-  numLevels:       5-10 price levels on each side
-  sizePerLevel:    configured per market (e.g., 0.1 BTC, 1 ETH)
-  refreshInterval: every block or every N seconds
-  maxInventory:    maximum net position before skewing quotes
-  skewFactor:      how aggressively to skew when inventory is unbalanced
+[[simulation.personas]]
+name = "scalper"
+count = 8
+avg_trades_per_hour = 30
+avg_hold_minutes = 5
+size_mean = "0.01"
+size_std = "0.005"
+strategy = "momentum"
 
-Loop:
-  1. Fetch current oracle price from Pyth
-  2. Calculate fair value (oracle TWAP)
-  3. Calculate inventory skew: if long, widen ask / tighten bid
-  4. Place bid ladder:  fair - spread/2, fair - spread, fair - 1.5*spread, ...
-  5. Place ask ladder:  fair + spread/2, fair + spread, fair + 1.5*spread, ...
-  6. Cancel stale orders that are >N ticks from current fair value
-  7. If inventory exceeds maxInventory: aggressively unwind
-```
+[[simulation.personas]]
+name = "swing"
+count = 6
+avg_trades_per_hour = 4
+avg_hold_minutes = 120
+size_mean = "0.05"
+size_std = "0.02"
+strategy = "mean_reversion"
 
-#### Noise Trader Bots (Simulated Activity)
-Generate realistic trading patterns to make the exchange feel alive.
+[[simulation.personas]]
+name = "whale"
+count = 2
+avg_trades_per_hour = 1
+avg_hold_minutes = 360
+size_mean = "0.5"
+size_std = "0.2"
+strategy = "trend_following"
 
-```
-Config:
-  numBots:           10-50 simulated accounts
-  tradeFrequency:    1-10 trades per minute across all bots
-  sizeDistribution:  log-normal (many small trades, few large)
-  directionBias:     slight trend-following (momentum) or mean-reversion
-  holdDuration:      random 1min - 4hrs before closing
+[[simulation.personas]]
+name = "random"
+count = 4
+avg_trades_per_hour = 6
+avg_hold_minutes = 30
+size_mean = "0.02"
+size_std = "0.01"
+strategy = "random"
 
-Behaviors:
-  - "Scalper": frequent small trades, tight stops, closes within minutes
-  - "Swing": less frequent, larger positions, holds for hours
-  - "Trend follower": follows price momentum, adds to winners
-  - "Contrarian": buys dips, sells rips, mean-reversion style
+[grid]
+enabled = true
+spacing_ticks = 10
+num_orders_per_side = 20
+order_size = "0.02"
+initial_usdc = "100000"
 
-Each bot:
-  1. Has its own funded account (testnet USDC)
-  2. Makes real on-chain transactions (indistinguishable from human traders)
-  3. Uses SDK to place orders via contracts
-  4. Manages its own positions with stop-losses and take-profits
-```
-
-#### Grid Bot (Passive Liquidity)
-Simple grid of limit orders at fixed intervals.
-
-```
-Config:
-  gridSpacing:  N ticks between each order
-  numOrders:    20-50 orders per side
-  orderSize:    fixed size per grid level
-
-Behavior:
-  Place buy orders at price - 1*spacing, price - 2*spacing, ...
-  Place sell orders at price + 1*spacing, price + 2*spacing, ...
-  When a grid order fills, place a new order on the opposite side
-  Self-sustaining: profits from spread capture
-```
-
-### 11.4 How Bots Interact with Real Users
-
-```
-                     Orderbook
-                   ┌───────────┐
-  Bot Asks ───────▶│ ASK SIDE  │◀─── Real User Asks
-                   │           │
-                   │  Matching │
-                   │  Engine   │
-                   │           │
-  Bot Bids ───────▶│ BID SIDE  │��─── Real User Bids
-                   └───────────┘
-
-  Real user places market buy → fills against bot's ask orders
-  Real user places limit bid  → bot's market sell fills against it
-  Bot-to-bot trades           → generate volume, keep book fresh
+[monitoring]
+prometheus_port = 9091
+pnl_log_interval_secs = 60
+max_loss_per_bot_usdc = "10000"  # halt bot if it loses more than this
 ```
 
-Key principles:
-- **Bot orders are real on-chain orders.** No special treatment in the matching engine. They go through the same contracts, same margin checks, same fees.
-- **Bots use separate accounts** with their own deposited testnet USDC. They are regular protocol users.
-- **No privileged access.** Bots don't bypass any checks. They can be liquidated, pay funding, and lose money just like real traders.
-- **Transparent.** Bot accounts can be publicly labeled so users know which liquidity is organic vs simulated.
-- **Gradually reduce bots** as organic volume grows. The MM bot should always run (even production DEXes use market makers), but noise traders can be phased out.
-
-### 11.5 Bot Configuration by Market
-
-| Market | MM Spread | Levels | Size/Level | Noise Bots | Noise Freq |
-|--------|-----------|--------|------------|------------|------------|
-| BTC-USD | 10 bps | 10 | 0.05 BTC | 15 | 5/min |
-| ETH-USD | 15 bps | 10 | 0.5 ETH | 15 | 5/min |
-| SOL-USD | 25 bps | 8 | 5 SOL | 10 | 3/min |
-| OP-USD | 30 bps | 6 | 50 OP | 5 | 2/min |
-| EUR-USD | 5 bps | 10 | 500 EUR | 8 | 3/min |
-| XAU-USD | 15 bps | 8 | 0.05 oz | 5 | 2/min |
-
-### 11.6 Bot Accounts & Funding
+### 11.5 How Bots Blend with Real Users
 
 ```
-Testnet USDC Faucet
-  └─ Mints to bot accounts on deployment
-  └─ Each bot account starts with 100,000 testnet USDC
-  └─ MM bot: 500,000 USDC (needs more for deep book)
-  └─ Faucet also available for real users (10,000 USDC per claim)
+                    ┌─────────────────────────────────────────┐
+                    │           Gaekju Orderbook                │
+                    │                                           │
+                    │  ASKS          ← source                   │
+                    │  $60,030  0.50  [Grid bot]                │
+                    │  $60,020  0.30  [Grid bot]                │
+                    │  $60,010  0.15  [Real user] + 0.05 [MM]  │
+                    │  $60,005  0.05  [MM bot]                  │
+                    │  ────── spread ──────                      │
+                    │  $59,995  0.05  [MM bot]                  │
+                    │  $59,990  0.10  [MM bot] + 0.08 [Real]   │
+                    │  $59,980  0.30  [Grid bot]                │
+                    │  $59,970  0.50  [Grid bot]                │
+                    │  BIDS                                      │
+                    └─────────────────────────────────────────┘
 
-Bot account naming:
-  0xBOT_MM_BTC    — BTC market maker
-  0xBOT_MM_ETH    — ETH market maker
-  0xBOT_NOISE_01  — noise trader #1
-  ...
+  A real user places a market buy for 0.1 BTC:
+    Fill 1: 0.05 @ $60,005 from MM bot     ← bot provides liquidity
+    Fill 2: 0.05 @ $60,010 from real user  ← organic liquidity
+
+  The user doesn't know (or care) which fills came from bots vs humans.
+  All orders are on-chain. All fills are real smart contract executions.
+  There is NO difference in how bot orders and human orders are processed.
 ```
 
-### 11.7 Build Phase Integration
+#### Transparency Model
 
-Bot development is part of **Phase 5** (testnet launch):
-- [ ] Implement gaekju-bots crate
-- [ ] Implement Avellaneda-Stoikov MM strategy
-- [ ] Implement noise trader behaviors (scalper, swing, trend, contrarian)
-- [ ] Implement grid bot
-- [ ] Implement oracle price tracking for fair value
-- [ ] Implement inventory management and risk limits
-- [ ] Config file for per-market bot parameters
-- [ ] Deploy bot accounts, fund with testnet USDC
-- [ ] Monitor bot PnL and adjust parameters
-- [ ] Blog post: "Bootstrapping Liquidity for a Testnet DEX"
+```
+Option A: Fully transparent (recommended for testnet)
+  - Bot accounts are labeled in the API/frontend
+  - "Liquidity provided by Gaekju MM" badge on bot orders
+  - Dashboard showing: organic vs bot volume ratio
+  - Goal: build trust, show honest bootstrapping
+
+Option B: Unlabeled (for production feel)
+  - Bot accounts are normal accounts
+  - Users can't distinguish bot from human
+  - Used when organic volume exceeds 50% of total
+```
+
+### 11.6 Cold Start → Live Market Progression
+
+```
+Week 0: Launch Day
+  ├─ Deploy contracts
+  ├─ Start MM bot → orderbook appears within 1 block
+  ├─ Start grid bot → deep liquidity within 5 minutes
+  ├─ Start simulation bots → trade feed starts flowing
+  ├─ Orderbook looks active: tight spreads, trades every few seconds
+  └─ Announce: "Gaekju testnet is live, BTC-USD with 50x leverage"
+
+Week 1-2: Early Users
+  ├─ Users claim testnet USDC from faucet
+  ├─ Their orders mix into the book alongside bot orders
+  ├─ Bot activity masks low organic volume (feels alive)
+  ├─ Track metric: organic_volume / total_volume (target: >5%)
+  └─ Adjust bot aggressiveness if organic orders aren't getting filled
+
+Week 3-4: Growing Organic
+  ├─ Reduce simulation bot trade frequency by 30%
+  ├─ Organic volume should compensate
+  ├─ MM bot stays at full capacity (always needed)
+  ├─ Track: organic_volume / total_volume (target: >20%)
+  └─ Add more markets based on demand (SOL, OP, EUR)
+
+Month 2+: Self-Sustaining
+  ├─ Disable simulation bots entirely
+  ├─ MM bot continues (even Binance has market makers)
+  ├─ Grid bot continues as backstop depth
+  ├─ Organic volume dominates
+  └─ Track: could the exchange run without bots? Target: mostly yes.
+```
+
+### 11.7 Key Metrics to Monitor
+
+```
+Dashboard: Gaekju Market Health
+
+  ┌─────────────────────────────────────────────────────┐
+  │ BTC-USD                                              │
+  │                                                       │
+  │ Spread:        6 bps ($3.60)       ✅ target: <10bps │
+  │ Bid depth:     0.82 BTC            ✅ target: >0.5   │
+  │ Ask depth:     0.75 BTC            ✅ target: >0.5   │
+  │ 24h volume:    45.3 BTC ($2.7M)    ✅                 │
+  │ Organic ratio: 34%                 ⚠️  target: >50%  │
+  │ Trades/hour:   142                  ✅ target: >50    │
+  │ Avg slippage:  3.2 bps (0.1 BTC)  ✅ target: <10bps │
+  │ MM uptime:     99.8%               ✅ target: >99%   │
+  │ Open interest: 12.4 BTC            ✅                 │
+  │ Funding rate:  +0.003%             (longs paying)     │
+  │ Liquidations:  2 (24h)                                │
+  └─────────────────────────────────────────────────────┘
+```
+
+### 11.8 Build Phase Integration
+
+```
+Phase 5 tasks (gaekju-bots crate):
+  - [ ] Market maker bot: oracle tracking, quoting, inventory management
+  - [ ] Grid bot: auto-rebalancing grid orders
+  - [ ] Simulation engine: persona system, scheduler, decision logic
+  - [ ] Config system: per-market TOML configs
+  - [ ] Monitoring: PnL tracking, Prometheus metrics, risk alerts
+  - [ ] Bot account deployment script + testnet USDC funding
+  - [ ] Integration test: boot all bots → verify book depth in <60s
+  - [ ] Dashboard: market health metrics
+  - [ ] Blog post: "Bootstrapping a Live Market on Testnet"
+
+Fee system tasks (added to Phase 3):
+  - [ ] Implement maker-taker fee model in OrderBook
+  - [ ] Maker rebate: -0.01% (paid to maker on fill)
+  - [ ] Taker fee: +0.05% (charged to taker on fill)
+  - [ ] Protocol revenue accumulation
+  - [ ] Fee tier system (volume-based discounts for Phase 6)
+```
 
 ---
 
