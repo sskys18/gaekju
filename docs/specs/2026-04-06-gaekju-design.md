@@ -959,7 +959,7 @@ gaekju/
 │   ├── gaekju-keeper/
 │   ├── gaekju-sdk/
 │   ├── gaekju-cli/
-│   └── gaekju-mirror/              # Hyperliquid liquidity mirror
+│   └── gaekju-mirror/              # Lighter liquidity mirror
 │
 ├── docs/
 │   ├── specs/
@@ -1541,9 +1541,16 @@ fundingPayment = mulFp(mulFp(positionSize, fundingDelta), markPrice)
 
 ---
 
-## 11. Live Market Operations — Hyperliquid Mirror + Testnet Traders
+## 11. Live Market Operations — Lighter Mirror + Testnet Traders
 
-Gaekju connects to **Hyperliquid** as its liquidity source. Real Hyperliquid orderbook depth is mirrored onto Gaekju's on-chain book. Testnet users trade against this real-world depth, and their orders coexist with the mirrored orders on the same on-chain orderbook.
+Gaekju connects to **Lighter.xyz** as its liquidity source. Lighter has 220+ perpetual markets including crypto, forex, and commodities — all with free unauthenticated API access. Real Lighter orderbook depth is mirrored onto Gaekju's on-chain book. Testnet users trade against this real-world depth, and their orders coexist with the mirrored orders on the same on-chain orderbook.
+
+**Why Lighter as the mirror source:**
+- Gaekju follows Lighter's architecture — same on-chain CLOB model
+- 220+ perp markets including RWA (EUR/USD, XAU/USD) — covers ALL Gaekju markets
+- Free, unauthenticated public API for orderbook + trade data
+- WebSocket with 50ms update frequency
+- Already has the exact market types we need (crypto + forex + commodities)
 
 ### 11.1 System Architecture
 
@@ -1551,13 +1558,13 @@ Gaekju connects to **Hyperliquid** as its liquidity source. Real Hyperliquid ord
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        Gaekju Live Market System                     │
 │                                                                       │
-│   Hyperliquid                    Gaekju (Giwa L2)                    │
+│   Lighter.xyz                    Gaekju (Giwa L2)                    │
 │   ┌──────────────┐              ┌──────────────────────────────┐    │
-│   │ Real orderbook│  WebSocket  │        On-Chain Orderbook     │    │
-│   │ BTC-PERP     │────────────▶│                                │    │
-│   │ ETH-PERP     │              │  ┌────────────────────────┐  │    │
-│   │ SOL-PERP     │              │  │  Mirrored Depth        │  │    │
-│   │ ...          │   Mirror     │  │  (from Hyperliquid)    │  │    │
+│   │ 220+ perp    │  WebSocket   │        On-Chain Orderbook     │    │
+│   │ markets      │────────────▶│                                │    │
+│   │ BTC, ETH,    │              │  ┌────────────────────────┐  │    │
+│   │ SOL, EUR,    │              │  │  Mirrored Depth        │  │    │
+│   │ XAU, ...     │   Mirror     │  │  (from Lighter)        │  │    │
 │   └──────────────┘   Agent      │  ├────────────────────────┤  │    │
 │                        (Rust)   │  │  Testnet User Orders   │  │    │
 │   ┌──────────────┐      │      │  │  (from real users)     │  │    │
@@ -1580,14 +1587,14 @@ Gaekju connects to **Hyperliquid** as its liquidity source. Real Hyperliquid ord
 
 ### 11.2 The Mirror Agent (`gaekju-mirror`)
 
-The Mirror Agent is the bridge between Hyperliquid and Gaekju. It reads Hyperliquid's live orderbook and trade feed, then places equivalent orders on Gaekju's on-chain orderbook.
+The Mirror Agent is the bridge between Lighter and Gaekju. It reads Lighter's live orderbook and trade feed, then places equivalent orders on Gaekju's on-chain orderbook.
 
 #### How It Works
 
 ```
-Hyperliquid WebSocket API (info.hyperliquid.xyz/ws):
+Lighter WebSocket API (info.hyperliquid.xyz/ws):
   - L2 orderbook snapshots (top N levels, pushed every 100ms)
-  - Trade feed (every fill on Hyperliquid, real-time)
+  - Trade feed (every fill on Lighter, real-time)
   - Market info (funding rates, open interest, etc.)
 
 Mirror Agent reads this data and translates it to Gaekju on-chain orders.
@@ -1598,9 +1605,9 @@ Mirror Agent reads this data and translates it to Gaekju on-chain orders.
 ```
 Every ~2 seconds (one Giwa block), the Mirror Agent:
 
-  1. READ: Fetch Hyperliquid BTC-PERP L2 orderbook (top 20 levels)
+  1. READ: Fetch Lighter BTC-PERP L2 orderbook (top 20 levels)
 
-     Hyperliquid book (real):
+     Lighter book (real):
      ASK $60,010  2.50 BTC
      ASK $60,005  1.20 BTC
      ASK $60,003  0.80 BTC
@@ -1635,26 +1642,26 @@ Every ~2 seconds (one Giwa block), the Mirror Agent:
      Router.batchPlaceOrders([...new/updated orders])
      Router.batchCancel([...stale orderIds])
 
-  Result: Gaekju's orderbook tracks Hyperliquid's within ~2 seconds.
+  Result: Gaekju's orderbook tracks Lighter's within ~2 seconds.
 ```
 
 #### Trade Mirroring (Activity)
 
 ```
-When a real trade happens on Hyperliquid:
+When a real trade happens on Lighter:
 
-  Hyperliquid trade: BTC-PERP, 0.5 BTC @ $60,001, buyer aggressive
+  Lighter trade: BTC-PERP, 0.5 BTC @ $60,001, buyer aggressive
 
   Mirror Agent:
     1. Receives trade via WebSocket
     2. Records it for the Gaekju trade feed (via indexer/API)
     3. The mirrored orderbook already reflects this:
-       - The ask at $60,001 that got filled on Hyperliquid
+       - The ask at $60,001 that got filled on Lighter
          also gets removed from Gaekju's mirror on next refresh
        - Price movement is naturally reflected
 
   Trade feed on Gaekju shows TWO types of trades:
-    a) Mirrored trades: real Hyperliquid trades, displayed in the feed
+    a) Mirrored trades: real Lighter trades, displayed in the feed
        (tagged as "external" in the API, shown on the chart)
     b) Testnet trades: actual on-chain fills between testnet users
        and mirror orders (tagged as "local")
@@ -1669,14 +1676,14 @@ The Mirror Agent operates a single on-chain account on Gaekju:
 
   Account: 0xMIRROR (dedicated address)
   Funded:  Unlimited testnet USDC (minted at deployment)
-  Role:    Places and cancels orders that mirror Hyperliquid depth
+  Role:    Places and cancels orders that mirror Lighter depth
 
   This account:
   - Has special minting rights for testnet USDC (admin-granted)
   - Places real on-chain limit orders (Post-Only to avoid self-matching)
   - Can accumulate positions when testnet users fill against it
   - Positions are irrelevant (testnet USDC is free) — no risk management needed
-  - Is publicly labeled: "Hyperliquid Mirror" in API/frontend
+  - Is publicly labeled: "Lighter Mirror" in API/frontend
 
   The account does NOT:
   - Execute any trading strategy
@@ -1715,89 +1722,158 @@ Scenario: Alice (testnet user) wants to long 0.1 BTC
     Mirror: accumulates 0.08 BTC short position (doesn't matter — testnet)
 
   What makes this feel real:
-  ✓ Alice got filled at a realistic price (tracks Hyperliquid within 2s)
+  ✓ Alice got filled at a realistic price (tracks Lighter within 2s)
   ✓ The slippage was realistic (0.08 BTC ate through 3 price levels)
   ✓ Bob (another real testnet user) was on the other side of part of the fill
   ✓ The orderbook updates immediately on-chain
   ✓ Funding rates reflect real market conditions (via Pyth oracle)
 ```
 
-### 11.4 Hyperliquid API Integration
+### 11.4 Lighter API Integration
 
 ```
-Hyperliquid provides free, unauthenticated WebSocket API:
+Lighter provides free, unauthenticated public API:
 
-  Endpoint: wss://api.hyperliquid.xyz/ws
+  REST Base URL:  https://mainnet.zklighter.elliot.ai/api/v1/
+  WebSocket URL:  wss://mainnet.zklighter.elliot.ai/stream
 
-  Subscribe to L2 book:
-    {"method": "subscribe", "subscription": {"type": "l2Book", "coin": "BTC"}}
+  ── REST: Get all available markets ──
+  GET /api/v1/orderBooks?filter=perp
 
-  Receive (every ~100ms):
-    {
-      "channel": "l2Book",
-      "data": {
-        "coin": "BTC",
-        "levels": [
-          [["60001.0", "0.30", 4], ["60003.0", "0.80", 8], ...],  // asks [price, size, numOrders]
-          [["59999.0", "0.25", 3], ["59997.0", "0.90", 6], ...]   // bids
-        ],
-        "time": 1712419200123
-      }
-    }
+  Response:
+  {
+    "order_books": [
+      {
+        "market_id": 1,
+        "symbol": "BTC-PERP",
+        "base_asset_id": 1,
+        "quote_asset_id": 0,
+        "taker_fee": "0.0005",
+        "maker_fee": "0.0002",
+        "min_base_amount": "0.00001",
+        "price_decimals": 1,
+        "amount_decimals": 5
+      },
+      ...  // 220+ perpetual markets
+    ]
+  }
 
-  Subscribe to trades:
-    {"method": "subscribe", "subscription": {"type": "trades", "coin": "BTC"}}
+  ── REST: Get orderbook depth ──
+  GET /api/v1/orderBookOrders?market_id=1&limit=50
 
-  Receive (on each trade):
-    {
-      "channel": "trades",
-      "data": [{
-        "coin": "BTC",
-        "side": "A",           // A=ask aggressor (buyer), B=bid aggressor (seller)
-        "px": "60001.0",
-        "sz": "0.50",
-        "time": 1712419200456,
-        "hash": "0x..."
-      }]
-    }
+  Response:
+  {
+    "asks": [
+      {"order_index": 42, "price": "60001.0", "remaining_base_amount": "0.30", "owner_account_index": 123},
+      {"order_index": 43, "price": "60003.0", "remaining_base_amount": "0.80", "owner_account_index": 456},
+      ...
+    ],
+    "bids": [
+      {"order_index": 44, "price": "59999.0", "remaining_base_amount": "0.25", "owner_account_index": 789},
+      ...
+    ],
+    "total_asks": 150,
+    "total_bids": 180
+  }
+
+  ── REST: Get recent trades ──
+  GET /api/v1/recentTrades?market_id=1&limit=100
+
+  Response:
+  {
+    "trades": [
+      {
+        "price": "60001.0",
+        "base_amount": "0.50",
+        "side": "long",
+        "taker_fee": "0.15",
+        "maker_fee": "0.06",
+        "timestamp": 1712419200456
+      },
+      ...
+    ]
+  }
+
+  ── WebSocket: Real-time orderbook updates ──
+  Connect: wss://mainnet.zklighter.elliot.ai/stream
+
+  Subscribe to orderbook (updates every ~50ms):
+    Subscribe to market data channels for order books, trades, BBO tickers
+
+  Rate limits (unauthenticated):
+    - 100 connections per IP
+    - 1,000 total subscriptions
+    - Keep-alive: 1 frame every 2 minutes
+    - Auto-disconnect after 24 hours
 ```
 
-#### Market Mapping
+#### Market Mapping — ALL Markets Mirrored
 
 ```
-Hyperliquid Coin    →    Gaekju Market
-BTC                 →    BTC-USD (marketId: 0)
-ETH                 →    ETH-USD (marketId: 1)
-SOL                 →    SOL-USD (marketId: 2)
-ARB                 →    ARB-USD (marketId: 3)
-OP                  →    OP-USD  (marketId: 4)
-DOGE                →    DOGE-USD (marketId: 5)
+Lighter has 220+ perp markets. Gaekju mirrors ALL of them.
+No market lacks a mirror source. Every Gaekju market has real Lighter depth.
 
-RWA markets (EUR, XAU, etc.) don't have Hyperliquid equivalents.
-For those: Pyth oracle price only, no depth mirror.
-Testnet users provide all liquidity for RWA markets organically.
+  Lighter Market     →    Gaekju Market         Leverage
+  ─────────────────────────────────────────────────────────
+  Crypto:
+  BTC-PERP (id:1)    →    BTC-USD (id: 0)       50x
+  ETH-PERP (id:2)    →    ETH-USD (id: 1)       50x
+  SOL-PERP (id:3)    →    SOL-USD (id: 2)       25x
+  ARB-PERP           →    ARB-USD (id: 3)       20x
+  OP-PERP            →    OP-USD  (id: 4)       20x
+  DOGE-PERP          →    DOGE-USD (id: 5)      10x
+
+  RWA (Lighter has these!):
+  EUR/USD-PERP       →    EUR-USD (id: 6)       25x (Lighter) → 10x (Gaekju)
+  GBP/USD-PERP       →    GBP-USD (id: 7)       25x → 10x
+  PAXG-PERP          →    XAU-USD (id: 8)       8x → 10x
+  SPX-PERP (if avail)→    SPX-USD (id: 10)      5x
+
+  + Any other Lighter market can be added to Gaekju by config.
+  The Mirror Agent auto-discovers new Lighter markets via /api/v1/orderBooks.
+
+  Key advantage over Lighter: Lighter already has forex and commodity
+  markets, so ALL Gaekju markets have real depth mirrored. No market
+  is left with "oracle price only, no depth."
+```
+
+#### Market Auto-Discovery
+
+```
+On startup, the Mirror Agent:
+  1. Calls GET /api/v1/orderBooks?filter=perp
+  2. Gets list of ALL 220+ Lighter perp markets
+  3. Matches against Gaekju's configured markets (by symbol)
+  4. For each match: start mirroring depth + trade feed
+  5. New markets on Lighter can be added to Gaekju by just updating config
+     (no code change needed, just add a market_id mapping)
+
+This means Gaekju can scale to 100+ markets trivially —
+each new market is one config line + one MarketFactory.createMarket() call.
 ```
 
 ### 11.5 Mirror Agent Crate
 
 ```
 crates/
-└── gaekju-mirror/              # Hyperliquid ↔ Gaekju liquidity bridge
+└── gaekju-mirror/              # Lighter ↔ Gaekju liquidity bridge
     ├── src/
     │   ├── main.rs              # Entry point, config loading
     │   ├── config.rs            # Mirror config (markets, depth scale, etc.)
     │   │
-    │   ├── hyperliquid/
+    │   ├── lighter/
     │   │   ├── mod.rs
-    │   │   ├── ws.rs            # WebSocket connection to Hyperliquid
-    │   │   ├── types.rs         # L2Book, Trade, MarketInfo types
-    │   │   └── parser.rs        # Parse Hyperliquid JSON messages
+    │   │   ├── rest.rs          # REST client for /api/v1/* endpoints
+    │   │   ├── ws.rs            # WebSocket connection to Lighter stream
+    │   │   ├── types.rs         # OrderBook, Trade, MarketInfo types
+    │   │   ├── parser.rs        # Parse Lighter JSON responses
+    │   │   └── discovery.rs     # Auto-discover markets from /orderBooks
     │   │
     │   ├── mirror/
     │   │   ├── mod.rs
-    │   │   ├── book_sync.rs     # Diff Hyperliquid book vs Gaekju orders
+    │   │   ├── book_sync.rs     # Diff Lighter book vs Gaekju orders
     │   │   ├── order_manager.rs # Track which on-chain orders are ours
-    │   │   ├── trade_relay.rs   # Relay Hyperliquid trades to API
+    │   │   ├── trade_relay.rs   # Relay Lighter trades to Gaekju API
     │   │   └── scaler.rs        # Scale depth (e.g., 10% of real book)
     │   │
     │   ├── chain/
@@ -1809,7 +1885,7 @@ crates/
     │   └── monitoring/
     │       ├── mod.rs
     │       ├── metrics.rs       # Prometheus: sync lag, order count, gas spent
-    │       └── health.rs        # Alert if Hyperliquid WS disconnects
+    │       └── health.rs        # Alert if Lighter WS disconnects
     │
     └── Cargo.toml
 ```
@@ -1818,22 +1894,52 @@ crates/
 
 ```toml
 # gaekju-mirror config
-[hyperliquid]
-ws_url = "wss://api.hyperliquid.xyz/ws"
+[lighter]
+rest_url = "https://mainnet.zklighter.elliot.ai/api/v1"
+ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
 reconnect_interval_ms = 5000
+auto_discover_markets = true   # Fetch market list from /orderBooks on startup
 
 [mirror]
-depth_scale = 0.1          # Show 10% of Hyperliquid's real depth
-max_levels = 15            # Mirror top 15 price levels per side
+depth_scale = 0.1          # Show 10% of Lighter's real depth
+max_levels = 20            # Mirror top 20 price levels per side
 refresh_interval_ms = 2000 # Sync every Giwa block (~2s)
 min_order_size = "0.001"   # Don't mirror tiny levels
+order_book_limit = 50      # Fetch top 50 levels from Lighter (scale down to 20)
 
-[mirror.markets]
-BTC = { gaekju_market_id = 0, enabled = true }
-ETH = { gaekju_market_id = 1, enabled = true }
-SOL = { gaekju_market_id = 2, enabled = true }
-ARB = { gaekju_market_id = 3, enabled = true }
-OP  = { gaekju_market_id = 4, enabled = true }
+# Explicit market mappings (lighter_market_id → gaekju_market_id)
+# Auto-discovery fills in any that match by symbol
+[[mirror.markets]]
+lighter_market_id = 1
+gaekju_market_id = 0
+symbol = "BTC-USD"
+enabled = true
+depth_scale_override = 0.05  # BTC has huge depth, show less
+
+[[mirror.markets]]
+lighter_market_id = 2
+gaekju_market_id = 1
+symbol = "ETH-USD"
+enabled = true
+
+[[mirror.markets]]
+lighter_market_id = 3
+gaekju_market_id = 2
+symbol = "SOL-USD"
+enabled = true
+
+# RWA markets — mirrored from Lighter's forex/commodity perps
+[[mirror.markets]]
+symbol = "EUR-USD"
+enabled = true
+# lighter_market_id auto-discovered from /orderBooks
+
+[[mirror.markets]]
+symbol = "XAU-USD"
+enabled = true
+
+# Add more markets by just adding entries here.
+# No code change needed.
 
 [chain]
 rpc_url = "https://rpc.giwa.chain"
@@ -1855,26 +1961,26 @@ struct MirrorState {
     live_orders: HashMap<(MarketId, Side, Tick), OrderId>,
 }
 
-async fn sync_loop(hl_ws: HyperliquidWs, chain: GaekjuChain, config: Config) {
+async fn sync_loop(lighter_ws: LighterClient, chain: GaekjuChain, config: Config) {
     let mut state = MirrorState::new();
 
     loop {
-        // 1. Get latest Hyperliquid book for all markets
-        let hl_books = hl_ws.get_latest_books().await;
+        // 1. Get latest Lighter book for all markets
+        let lighter_books = lighter_ws.get_latest_books().await;
 
-        for (coin, hl_book) in hl_books {
+        for (coin, lighter_book) in lighter_books {
             let market_id = config.market_mapping[&coin];
             let scale = config.depth_scale;  // e.g., 0.1
 
             // 2. Build target book state (what Gaekju should look like)
             let mut target_orders: Vec<(Side, Price, Size)> = vec![];
-            for (price, size, _) in hl_book.asks.iter().take(config.max_levels) {
+            for (price, size, _) in lighter_book.asks.iter().take(config.max_levels) {
                 let scaled = size * scale;
                 if scaled >= config.min_order_size {
                     target_orders.push((ASK, price, scaled));
                 }
             }
-            for (price, size, _) in hl_book.bids.iter().take(config.max_levels) {
+            for (price, size, _) in lighter_book.bids.iter().take(config.max_levels) {
                 let scaled = size * scale;
                 if scaled >= config.min_order_size {
                     target_orders.push((BID, price, scaled));
@@ -1935,12 +2041,12 @@ async fn sync_loop(hl_ws: HyperliquidWs, chain: GaekjuChain, config: Config) {
 
 ### 11.7 Trade Feed Integration
 
-Hyperliquid's real trades appear in Gaekju's trade feed alongside testnet trades:
+Lighter's real trades appear in Gaekju's trade feed alongside testnet trades:
 
 ```
 Gaekju API trade feed (WebSocket):
 
-  // Real Hyperliquid trade (relayed, informational)
+  // Real Lighter trade (relayed, informational)
   {
     "channel": "trades",
     "market": 0,
@@ -1983,7 +2089,7 @@ From the testnet user's perspective:
   3. See trade feed with trades happening in real-time
   4. Claim 10,000 testnet USDC from faucet
   5. Place a market long 0.1 BTC → fills instantly at ~$60,001
-     (against mirror orders that reflect real Hyperliquid depth)
+     (against mirror orders that reflect real Lighter depth)
   6. Watch position PnL move with real BTC price
   7. Get liquidated if they use high leverage and BTC drops (real risk feel)
   8. Pay/receive funding rates based on real market premium
@@ -1991,8 +2097,8 @@ From the testnet user's perspective:
 
   What's real:
   ✓ Prices (Pyth oracle = real aggregated price)
-  ✓ Orderbook depth shape (mirrors Hyperliquid)
-  ✓ Trade flow (Hyperliquid trades appear in feed)
+  ✓ Orderbook depth shape (mirrors Lighter)
+  ✓ Trade flow (Lighter trades appear in feed)
   ✓ Funding rates (calculated from real mark vs index)
   ✓ Liquidation mechanics (fully functional)
   ✓ Smart contract execution (everything is on-chain)
@@ -2000,42 +2106,40 @@ From the testnet user's perspective:
   What's testnet:
   ✗ USDC is not real money (free from faucet)
   ✗ Mirror agent has unlimited capital (no real risk)
-  ✗ Mirror agent doesn't hedge on Hyperliquid (one-way bridge)
+  ✗ Mirror agent doesn't hedge on Lighter (one-way bridge)
   ✗ RWA markets have no depth mirror (oracle price only)
 ```
 
-### 11.9 RWA Markets (No Mirror Available)
+### 11.9 Full Market Coverage
 
-For markets like EUR-USD, XAU-USD where Hyperliquid has no equivalent:
+Unlike Hyperliquid (crypto-only), Lighter already lists forex and commodity perps. This means **every Gaekju market has a Lighter mirror source**:
 
 ```
-RWA markets operate differently:
+Coverage:
 
-  Price: Pyth oracle only (real forex/commodity prices)
-  Depth: Provided entirely by testnet users' limit orders
-  No mirror agent for these markets
+  Crypto (BTC, ETH, SOL, ARB, OP, DOGE, ...): ✅ Lighter has all
+  Forex (EUR/USD, GBP/USD):                    ✅ Lighter has forex perps (25x)
+  Commodities (XAU via PAXG):                  ✅ Lighter has PAXG-PERP (8x)
+  Indices (SPX):                               ⚠️  Check Lighter listing
 
-  To bootstrap RWA liquidity:
-  1. Price feed is live from day one (Pyth has EUR/USD, XAU/USD feeds)
-  2. Lower leverage (10x) reduces capital requirements
-  3. Wider tick sizes reduce gas costs for market makers
-  4. RWA markets launch AFTER crypto markets have organic users
-     who might also want to trade forex/gold
-  5. If RWA books are too thin, consider adding a simple
-     price-based liquidity provider in v2 (trade against oracle
-     price ± configurable spread, like GMX)
+  Result: No market is left without depth. All Gaekju markets
+  show real orderbook depth mirrored from Lighter's live markets.
+
+  If Lighter adds new markets, Gaekju can mirror them by adding
+  one config entry. The auto-discovery feature detects new Lighter
+  markets and suggests config additions.
 ```
 
 ### 11.10 Latency & Sync Quality
 
 ```
 Sync chain:
-  Hyperliquid updates book → ~100ms
+  Lighter updates book → ~100ms
   Mirror Agent receives WS  → ~50ms network
   Mirror Agent diffs + submits tx → ~100ms compute
   Giwa L2 block inclusion → ~2s
   ─────────────────────────────
-  Total lag: ~2.5 seconds behind Hyperliquid
+  Total lag: ~2.5 seconds behind Lighter
 
   In practice this means:
   - Slow price moves (normal trading): book tracks perfectly
@@ -2045,8 +2149,8 @@ Sync chain:
     Mitigated by the Oracle staleness check (won't liquidate on stale data).
 
   Sync metrics (target):
-  ├─ Book update latency: <3s (Hyperliquid → Gaekju visible)
-  ├─ Price accuracy: within 5 bps of Hyperliquid mid-price
+  ├─ Book update latency: <3s (Lighter → Gaekju visible)
+  ├─ Price accuracy: within 5 bps of Lighter mid-price
   ├─ Uptime: >99% (reconnect on WS drop)
   └─ Gas efficiency: <500k gas per sync cycle per market
 ```
@@ -2056,17 +2160,18 @@ Sync chain:
 ```
 Mirror Agent is part of Phase 5 (testnet launch):
 
-  - [ ] gaekju-mirror crate: Hyperliquid WS client
+  - [ ] gaekju-mirror crate: Lighter REST + WebSocket client
+  - [ ] Market auto-discovery from /api/v1/orderBooks
   - [ ] L2 book parser and depth scaler
   - [ ] Book diff algorithm (minimize on-chain order churn)
   - [ ] Batch order submission with nonce management
   - [ ] Trade relay to Gaekju API (external trade feed)
-  - [ ] Market mapping config (Hyperliquid coin → Gaekju marketId)
+  - [ ] Market mapping config (Lighter coin → Gaekju marketId)
   - [ ] Monitoring: sync lag, order count, gas usage, WS health
   - [ ] Mirror account deployment + testnet USDC minting
   - [ ] Integration test: start mirror → verify book matches HL within 5s
-  - [ ] Resilience: auto-reconnect, graceful degradation on HL downtime
-  - [ ] Blog post: "Bridging Real Liquidity to a Testnet DEX"
+  - [ ] Resilience: auto-reconnect, graceful degradation on Lighter downtime
+  - [ ] Blog post: "Mirroring Lighter.xyz Liquidity onto a Testnet DEX"
 
 Fee system tasks (added to Phase 3):
   - [ ] Implement maker-taker fee model in OrderBook
