@@ -10,20 +10,12 @@ interface IPositionManager {
         uint256 lastUpdated;
     }
 
-    function updatePosition(
-        address account,
-        uint256 marketId,
-        int256 sizeDelta,
-        uint256 fillPrice,
-        uint256 marginDelta
-    ) external;
+    function updatePosition(address account, uint256 marketId, int256 sizeDelta, uint256 fillPrice, uint256 marginDelta)
+        external;
 
-    function liquidatePosition(
-        address account,
-        uint256 marketId,
-        int256 sizeDelta,
-        uint256 liquidationPrice
-    ) external;
+    function liquidatePosition(address account, uint256 marketId, int256 sizeDelta, uint256 liquidationPrice)
+        external
+        returns (uint256 deficit);
 
     function getPosition(address account, uint256 marketId) external view returns (Position memory);
     function getUnrealizedPnl(address account, uint256 marketId) external view returns (int256);

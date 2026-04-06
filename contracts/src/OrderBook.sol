@@ -171,6 +171,8 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         uint256 tick = bestAskTick;
         if (tick == 0) return remaining;
 
+        uint256 takerLimitPrice = TickMath.tickToPrice(limitTick, tickSize);
+
         while (remaining > 0 && tick != 0 && tick <= limitTick) {
             uint256 headId = askHeadAtTick[tick];
 
@@ -180,7 +182,7 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
                     continue;
                 }
                 bool cont;
-                (remaining, headId, cont) = _fillOneAsk(taker, takerOrderId, tick, headId, remaining);
+                (remaining, headId, cont) = _fillOneAsk(taker, takerOrderId, tick, headId, remaining, takerLimitPrice);
                 if (!cont) break;
             }
 
@@ -203,6 +205,8 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         uint256 tick = bestBidTick;
         if (tick == 0) return remaining;
 
+        uint256 takerLimitPrice = TickMath.tickToPrice(limitTick, tickSize);
+
         while (remaining > 0 && tick != 0 && tick >= limitTick) {
             uint256 headId = bidHeadAtTick[tick];
 
@@ -212,7 +216,7 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
                     continue;
                 }
                 bool cont;
-                (remaining, headId, cont) = _fillOneBid(taker, takerOrderId, tick, headId, remaining);
+                (remaining, headId, cont) = _fillOneBid(taker, takerOrderId, tick, headId, remaining, takerLimitPrice);
                 if (!cont) break;
             }
 
@@ -228,10 +232,14 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         return remaining;
     }
 
-    function _fillOneAsk(address taker, uint256 takerOrderId, uint256 tick, uint256 headId, uint256 remaining)
-        internal
-        returns (uint256 newRemaining, uint256 nextHeadId, bool cont)
-    {
+    function _fillOneAsk(
+        address taker,
+        uint256 takerOrderId,
+        uint256 tick,
+        uint256 headId,
+        uint256 remaining,
+        uint256 takerLimitPrice
+    ) internal returns (uint256 newRemaining, uint256 nextHeadId, bool cont) {
         bytes32 s1 = orderSlot1[headId];
         uint256 makerSize = PackedOrder.getSize(s1);
         uint256 fillSize = FixedPointMath.min(remaining, makerSize);
@@ -239,7 +247,7 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         uint256 nextId = nextOrder[headId];
         uint256 fillPrice = TickMath.tickToPrice(tick, tickSize);
 
-        _executeFill(maker, taker, fillPrice, fillSize, true, headId, takerOrderId);
+        _executeFill(maker, taker, fillPrice, fillSize, true, headId, takerOrderId, takerLimitPrice);
         newRemaining = remaining - fillSize;
 
         if (fillSize == makerSize) {
@@ -252,10 +260,14 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         }
     }
 
-    function _fillOneBid(address taker, uint256 takerOrderId, uint256 tick, uint256 headId, uint256 remaining)
-        internal
-        returns (uint256 newRemaining, uint256 nextHeadId, bool cont)
-    {
+    function _fillOneBid(
+        address taker,
+        uint256 takerOrderId,
+        uint256 tick,
+        uint256 headId,
+        uint256 remaining,
+        uint256 takerLimitPrice
+    ) internal returns (uint256 newRemaining, uint256 nextHeadId, bool cont) {
         bytes32 s1 = orderSlot1[headId];
         uint256 makerSize = PackedOrder.getSize(s1);
         uint256 fillSize = FixedPointMath.min(remaining, makerSize);
@@ -263,7 +275,7 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         uint256 nextId = nextOrder[headId];
         uint256 fillPrice = TickMath.tickToPrice(tick, tickSize);
 
-        _executeFill(maker, taker, fillPrice, fillSize, false, headId, takerOrderId);
+        _executeFill(maker, taker, fillPrice, fillSize, false, headId, takerOrderId, takerLimitPrice);
         newRemaining = remaining - fillSize;
 
         if (fillSize == makerSize) {
@@ -283,7 +295,8 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         uint256 size,
         bool takerSide,
         uint256 makerOrderId,
-        uint256 takerOrderId
+        uint256 takerOrderId,
+        uint256 takerLimitPrice
     ) internal {
         // assembly block prevents Yul IR from inlining this function into the matching loop
         assembly { }
@@ -297,7 +310,7 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
             vault.realizePnl(taker, -FixedPointMath.mulFpSigned(int256(notional), takerFeeRate));
         }
 
-        _updatePositions(maker, taker, price, size, takerSide, makerMarginUsed);
+        _updatePositions(maker, taker, price, size, takerSide, makerMarginUsed, takerLimitPrice);
 
         emit OrderMatched(marketId, makerOrderId, takerOrderId, price, size);
         emit Fill(marketId, maker, taker, price, size, takerSide);
@@ -315,12 +328,14 @@ contract OrderBook is IOrderBook, UUPSUpgradeable, AccessControlUpgradeable, Ree
         uint256 price,
         uint256 size,
         bool takerSide,
-        uint256 makerMarginUsed
+        uint256 makerMarginUsed,
+        uint256 takerLimitPrice
     ) internal {
         if (address(positionManager) != address(0)) {
             int256 makerSizeDelta = takerSide ? -int256(size) : int256(size);
             int256 takerSizeDelta = takerSide ? int256(size) : -int256(size);
-            uint256 takerMarginForFill = marginEngine.getRequiredMargin(marketId, size, price);
+            // Use taker's limit price (reservation price) not fill price — avoids over-consuming reserved margin
+            uint256 takerMarginForFill = marginEngine.getRequiredMargin(marketId, size, takerLimitPrice);
             positionManager.updatePosition(maker, marketId, makerSizeDelta, price, makerMarginUsed);
             positionManager.updatePosition(taker, marketId, takerSizeDelta, price, takerMarginForFill);
         } else {

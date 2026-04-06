@@ -17,7 +17,7 @@ interface IVault {
     function unlockOrderMargin(address account, uint256 amount) external;
     function transferToInsuranceFund(uint256 amount) external;
     function drawFromInsuranceFund(uint256 amount) external;
-    function realizePnl(address account, int256 pnl) external;
+    function realizePnl(address account, int256 pnl) external returns (uint256 deficit);
 
     event Deposited(address indexed account, uint256 amount);
     event Withdrawn(address indexed account, uint256 amount);

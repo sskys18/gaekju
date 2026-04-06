@@ -102,22 +102,30 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
         insuranceFund -= amount;
     }
 
-    function realizePnl(address account, int256 pnl) external onlyRole(AUTHORIZED_ROLE) {
+    function realizePnl(address account, int256 pnl) external onlyRole(AUTHORIZED_ROLE) returns (uint256 deficit) {
         if (pnl >= 0) {
             balances[account] += uint256(pnl);
             totalDeposits += uint256(pnl);
-        } else {
-            uint256 loss = uint256(-pnl);
-            if (balances[account] >= loss) {
-                balances[account] -= loss;
-            } else {
-                // Loss exceeds free balance — take from locked margin as well
-                uint256 remaining = loss - balances[account];
-                balances[account] = 0;
-                lockedMargin[account] -= remaining;
-            }
-            totalDeposits -= loss;
+            emit PnlRealized(account, pnl);
+            return 0;
         }
+        uint256 loss = uint256(-pnl);
+        // Exhaust free balance first
+        if (loss <= balances[account]) {
+            balances[account] -= loss;
+            totalDeposits -= loss;
+            emit PnlRealized(account, pnl);
+            return 0;
+        }
+        uint256 fromBalance = balances[account];
+        loss -= fromBalance;
+        totalDeposits -= fromBalance;
+        balances[account] = 0;
+        // Then exhaust locked margin
+        uint256 fromLocked = loss <= lockedMargin[account] ? loss : lockedMargin[account];
+        lockedMargin[account] -= fromLocked;
+        totalDeposits -= fromLocked;
+        deficit = loss - fromLocked; // uncovered loss — caller must draw from insurance fund
         emit PnlRealized(account, pnl);
     }
 

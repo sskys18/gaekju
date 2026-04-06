@@ -114,9 +114,9 @@ contract LiquidationEngine is ILiquidationEngine, UUPSUpgradeable, AccessControl
         uint256 insuranceFee = FixedPointMath.mulFp(liqNotional, config.insuranceFundFeeRate);
         uint256 totalFee = liquidatorFee + insuranceFee;
 
-        // Execute liquidation via PositionManager
+        // Execute liquidation via PositionManager; capture any uncovered deficit
         int256 sizeDelta = pos.size > 0 ? -int256(reduceSize) : int256(reduceSize);
-        positionManager.liquidatePosition(account, marketId, sizeDelta, markPrice);
+        uint256 positionDeficit = positionManager.liquidatePosition(account, marketId, sizeDelta, markPrice);
 
         // Distribute fees from account's released balance
         if (vault.balances(account) >= totalFee) {
@@ -144,17 +144,14 @@ contract LiquidationEngine is ILiquidationEngine, UUPSUpgradeable, AccessControl
             vault.transferToInsuranceFund(insuranceFee);
         }
 
-        // Handle deficit: insurance fund covers shortfall on full liquidation
-        if (isFullLiquidation) {
-            int256 remainingEquity = int256(vault.balances(account)) + int256(vault.lockedMargin(account));
-            if (remainingEquity < 0) {
-                uint256 deficit = uint256(-remainingEquity);
-                uint256 fundBalance = vault.insuranceFund();
-                if (fundBalance >= deficit) {
-                    vault.drawFromInsuranceFund(deficit);
-                    vault.realizePnl(account, int256(deficit));
-                }
+        // Cover any position deficit from insurance fund
+        if (positionDeficit > 0) {
+            uint256 fundBalance = vault.insuranceFund();
+            if (fundBalance >= positionDeficit) {
+                vault.drawFromInsuranceFund(positionDeficit);
+                vault.realizePnl(account, int256(positionDeficit));
             }
+            // If insurance fund insufficient, position remains underwater — ADL handles it
         }
 
         emit PositionLiquidated(
@@ -200,19 +197,17 @@ contract LiquidationEngine is ILiquidationEngine, UUPSUpgradeable, AccessControl
         uint256 adlSize = FixedPointMath.min(absSize, FixedPointMath.abs(targetPos.size));
 
         int256 bankruptDelta = bankruptPos.size > 0 ? -int256(adlSize) : int256(adlSize);
-        positionManager.liquidatePosition(bankruptAccount, marketId, bankruptDelta, markPrice);
+        uint256 bankruptDeficit = positionManager.liquidatePosition(bankruptAccount, marketId, bankruptDelta, markPrice);
 
         int256 targetDelta = targetPos.size > 0 ? -int256(adlSize) : int256(adlSize);
         positionManager.liquidatePosition(bestTarget, marketId, targetDelta, markPrice);
 
-        // Cover deficit from insurance fund if possible
-        int256 bankruptBalance = int256(vault.balances(bankruptAccount));
-        if (bankruptBalance < 0) {
-            uint256 deficit = uint256(-bankruptBalance);
+        // Cover bankrupt account deficit from insurance fund if possible
+        if (bankruptDeficit > 0) {
             uint256 fundBalance = vault.insuranceFund();
-            if (fundBalance >= deficit) {
-                vault.drawFromInsuranceFund(deficit);
-                vault.realizePnl(bankruptAccount, int256(deficit));
+            if (fundBalance >= bankruptDeficit) {
+                vault.drawFromInsuranceFund(bankruptDeficit);
+                vault.realizePnl(bankruptAccount, int256(bankruptDeficit));
             }
         }
 

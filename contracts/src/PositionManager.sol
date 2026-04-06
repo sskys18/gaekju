@@ -40,10 +40,7 @@ contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgr
         _;
     }
 
-    function initialize(address _vault, address _marginEngine, address _oracle, address _admin)
-        external
-        initializer
-    {
+    function initialize(address _vault, address _marginEngine, address _oracle, address _admin) external initializer {
         __AccessControl_init();
         vault = IVault(_vault);
         marginEngine = IMarginEngine(_marginEngine);
@@ -59,23 +56,21 @@ contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgr
         liquidationEngine = _liquidationEngine;
     }
 
-    function updatePosition(
-        address account,
-        uint256 marketId,
-        int256 sizeDelta,
-        uint256 fillPrice,
-        uint256 marginDelta
-    ) external onlyOrderBook nonReentrant {
+    function updatePosition(address account, uint256 marketId, int256 sizeDelta, uint256 fillPrice, uint256 marginDelta)
+        external
+        onlyOrderBook
+        nonReentrant
+    {
         _updatePositionInternal(account, marketId, sizeDelta, fillPrice, marginDelta);
     }
 
-    function liquidatePosition(
-        address account,
-        uint256 marketId,
-        int256 sizeDelta,
-        uint256 liquidationPrice
-    ) external onlyLiquidationEngine nonReentrant {
-        _liquidateInternal(account, marketId, sizeDelta, liquidationPrice);
+    function liquidatePosition(address account, uint256 marketId, int256 sizeDelta, uint256 liquidationPrice)
+        external
+        onlyLiquidationEngine
+        nonReentrant
+        returns (uint256 deficit)
+    {
+        return _liquidateInternal(account, marketId, sizeDelta, liquidationPrice);
     }
 
     function _updatePositionInternal(
@@ -169,12 +164,10 @@ contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgr
         }
     }
 
-    function _liquidateInternal(
-        address account,
-        uint256 marketId,
-        int256 sizeDelta,
-        uint256 liquidationPrice
-    ) internal {
+    function _liquidateInternal(address account, uint256 marketId, int256 sizeDelta, uint256 liquidationPrice)
+        internal
+        returns (uint256 deficit)
+    {
         Position storage pos = _positions[account][marketId];
         if (pos.size == 0) revert NoPosition();
 
@@ -184,9 +177,9 @@ contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgr
         int256 realizedPnl = _calculateClosePnl(pos.size, pos.entryPrice, liquidationPrice, closeSize);
 
         if (closeSize == absOldSize) {
-            // Full liquidation
+            // Full liquidation — unlockMargin BEFORE realizePnl (invariant from Phase 2)
             vault.unlockMargin(account, pos.collateral);
-            vault.realizePnl(account, realizedPnl);
+            deficit = vault.realizePnl(account, realizedPnl);
 
             emit PositionClosed(account, marketId, realizedPnl);
             delete _positions[account][marketId];
@@ -196,7 +189,7 @@ contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgr
             uint256 proportionalCollateral = FixedPointMath.mulDiv(pos.collateral, closeSize, absOldSize);
             pos.collateral -= proportionalCollateral;
             vault.unlockMargin(account, proportionalCollateral);
-            vault.realizePnl(account, realizedPnl);
+            deficit = vault.realizePnl(account, realizedPnl);
             pos.size = pos.size + sizeDelta;
             pos.lastUpdated = block.timestamp;
 

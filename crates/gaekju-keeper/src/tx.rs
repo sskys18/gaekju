@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct TxManager {
     pub provider: DynProvider,
-    pub wallet: EthereumWallet,
+    _wallet: EthereumWallet,
     pub sender: Address,
     nonce: AtomicU64,
 }
@@ -27,12 +27,13 @@ impl TxManager {
 
         Ok(Self {
             provider,
-            wallet,
+            _wallet: wallet,
             sender,
             nonce: AtomicU64::new(nonce),
         })
     }
 
+    #[allow(dead_code)] // used in Phase 3 for rapid sequential nonce management
     pub fn next_nonce(&self) -> u64 {
         self.nonce.fetch_add(1, Ordering::SeqCst)
     }
