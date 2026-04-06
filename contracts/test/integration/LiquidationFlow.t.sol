@@ -69,8 +69,7 @@ contract LiquidationFlowTest is Test {
                 new ERC1967Proxy(
                     address(new PositionManager()),
                     abi.encodeCall(
-                        PositionManager.initialize,
-                        (address(vault), address(engine), address(oracle), admin)
+                        PositionManager.initialize, (address(vault), address(engine), address(oracle), admin)
                     )
                 )
             )
@@ -111,8 +110,7 @@ contract LiquidationFlowTest is Test {
         oracle.setMarketOracle(MARKET_ID, bytes32(uint256(1)), 60);
         book.setFeeConfig(0, 0);
         le.setLiquidationConfig(
-            MARKET_ID,
-            ILiquidationEngine.LiquidationConfig({ liquidatorFeeRate: 5e15, insuranceFundFeeRate: 5e15 })
+            MARKET_ID, ILiquidationEngine.LiquidationConfig({ liquidatorFeeRate: 5e15, insuranceFundFeeRate: 5e15 })
         );
         vm.stopPrank();
 
@@ -161,9 +159,7 @@ contract LiquidationFlowTest is Test {
 
         // Alice's position reduced or closed
         IPositionManager.Position memory alicePostLiq = pm.getPosition(alice, MARKET_ID);
-        assertTrue(
-            alicePostLiq.size == 0 || FixedPointMath.abs(alicePostLiq.size) < FixedPointMath.abs(alicePos.size)
-        );
+        assertTrue(alicePostLiq.size == 0 || FixedPointMath.abs(alicePostLiq.size) < FixedPointMath.abs(alicePos.size));
     }
 
     function test_adlFlow() public {

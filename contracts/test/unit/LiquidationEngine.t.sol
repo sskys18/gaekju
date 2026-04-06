@@ -73,8 +73,7 @@ contract LiquidationEngineTest is Test {
                 new ERC1967Proxy(
                     address(new PositionManager()),
                     abi.encodeCall(
-                        PositionManager.initialize,
-                        (address(vault), address(engine), address(oracle), admin)
+                        PositionManager.initialize, (address(vault), address(engine), address(oracle), admin)
                     )
                 )
             )

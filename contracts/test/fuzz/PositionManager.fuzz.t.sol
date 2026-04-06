@@ -29,21 +29,18 @@ contract PositionManagerFuzzTest is Test {
 
         // mulFp/divFp accumulate rounding errors proportional to size ratios.
         // Tolerance: 1 unit per 1e9 of size ratio (still negligible vs real prices).
-        uint256 sizeRatio = FixedPointMath.divFp(
-            FixedPointMath.max(oldSize, newSize), FixedPointMath.min(oldSize, newSize)
-        );
+        uint256 sizeRatio =
+            FixedPointMath.divFp(FixedPointMath.max(oldSize, newSize), FixedPointMath.min(oldSize, newSize));
         uint256 tolerance = sizeRatio / 1e9 + 2;
         assertTrue(avgPrice + tolerance >= minPrice, "avg below min");
         assertTrue(avgPrice <= maxPrice + tolerance, "avg above max");
     }
 
     /// @dev Close PnL + remaining position value should equal total position value.
-    function testFuzz_closePnl_conservesValue(
-        uint64 rawSize,
-        uint64 rawEntry,
-        uint64 rawClose,
-        uint64 rawCloseRatio
-    ) public pure {
+    function testFuzz_closePnl_conservesValue(uint64 rawSize, uint64 rawEntry, uint64 rawClose, uint64 rawCloseRatio)
+        public
+        pure
+    {
         uint256 posSize = bound(uint256(rawSize), 0.001e18, 100e18);
         uint256 entryPrice = bound(uint256(rawEntry), 100e18, 1_000_000e18);
         uint256 closePrice = bound(uint256(rawClose), 100e18, 1_000_000e18);
