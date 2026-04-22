@@ -1,5 +1,8 @@
 # Phase 3 Handoff — FundingRate, MarketFactory, Router
 
+> **2026-04-22 Status:** Historical. Superseded by Path B pivot (ADR-0012). Bug fixes (C1, C2, m1) and FundingRate design decisions remain valid; MarketFactory/Router/IOC-FOK discussion is obsolete.
+
+
 **Date:** 2026-04-07
 **Commit:** `2ad666c`
 **Status:** Bug fixes committed + plan written + Codex adversarial review complete. Implementation not yet started.

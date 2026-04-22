@@ -1,6 +1,6 @@
 # Gaekju
 
-Perpetual DEX on Giwa Chain (OP Stack L2). On-chain CLOB following the Lighter.xyz architecture.
+Perpetual DEX on Giwa Chain (OP Stack L2). ZK-proven off-chain matcher. Rust sequencer matches orders, SP1 zkVM proves correctness, Settlement.sol on Giwa verifies and applies state delta. Per ADR-0012.
 
 ## Build Commands
 
@@ -17,12 +17,14 @@ Perpetual DEX on Giwa Chain (OP Stack L2). On-chain CLOB following the Lighter.x
 - `cargo fmt --all -- --check` - format check
 
 ## Architecture
-- `contracts/src/libraries/` - pure math/encoding libs (BitmapLib, FixedPointMath, PackedOrder, TickMath)
+- `contracts/src/libraries/` - pure math/encoding libs (FixedPointMath)
 - `contracts/src/interfaces/` - contract interfaces
-- `contracts/src/*.sol` - core contracts (Vault, OracleAdapter, MarginEngine, OrderBook, etc.)
+- `contracts/src/*.sol` - core contracts (Vault, OracleAdapter, MarginEngine, PositionManager, FundingRate, LiquidationEngine, Settlement, Router)
 - `contracts/test/` - unit/, integration/, fuzz/, mocks/
 - `crates/gaekju-types/` - shared Rust types + ABI bindings
-- `crates/gaekju-mirror/` - Lighter.xyz liquidity bridge (NOT bots)
+- `crates/gaekju-sequencer/` - off-chain Rust matching engine (accepts EIP-712 intents, emits batches)
+- `crates/gaekju-prover/` - SP1 zkVM proving service (re-executes matcher, emits SNARK proof)
+- `crates/gaekju-mirror/` - Lighter.xyz liquidity bridge (writes to sequencer, NOT bots)
 
 ## Design Spec
 
@@ -46,3 +48,4 @@ Read it before making architectural decisions.
 - Do not use 8-hour funding (use 1 hour)
 - Do not create bot/simulation systems (mirror Lighter.xyz instead)
 - Do not add cross-margin logic (isolated margin only in v1)
+- Do not reintroduce on-chain matching logic — all matching lives in the Rust sequencer. Settlement.sol only verifies SP1 proofs and applies deltas.

@@ -1,5 +1,8 @@
 # Phase 3: FundingRate, MarketFactory, Router Implementation Plan
 
+> **2026-04-22 Status:** Superseded by contracts-v2 plan (2026-04-22-contracts-v2.md) under Path B pivot (ADR-0012). FundingRate design survives with SETTLEMENT_ROLE caller guard. MarketFactory, Router, OrderBook IOC/FOK tasks are obsolete — replaced by Settlement-deploying factory and thin Router. Kept for historical reference.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use sspower:subagent-driven-development (recommended) or sspower:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Complete the core protocol loop — live funding rates, a factory that deploys new markets in one call, and a Router that gives traders reduce-only, IOC/FOK/Market order types, and atomic deposit+trade.

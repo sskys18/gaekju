@@ -69,7 +69,7 @@ This is implemented using 18-decimal fixed-point math (`mulFp` / `divFp`) to avo
 
 This is where the plumbing gets interesting. When an order fills:
 
-1. OrderBook calls `PositionManager.updatePosition(account, marketId, sizeDelta, fillPrice, marginDelta)`
+1. Settlement (applying a proven batch from the sequencer) calls `PositionManager.updatePosition(account, marketId, sizeDelta, fillPrice, marginDelta)`
 2. PositionManager calls `vault.unlockOrderMargin(account, marginDelta)` — releases order reservation
 3. PositionManager calls `vault.lockMargin(account, marginDelta)` — locks as position collateral
 4. Position struct is updated with new size, entry price, and collateral

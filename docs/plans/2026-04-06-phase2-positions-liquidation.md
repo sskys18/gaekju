@@ -1,5 +1,8 @@
 # Phase 2: Position Management & Liquidation Engine — Implementation Plan
 
+> **2026-04-22 Status:** Executed. 131 tests green. Under Path B pivot (ADR-0012), Task 4 (OrderBook → PositionManager wiring) rebinds caller from ORDERBOOK_ROLE to SETTLEMENT_ROLE; test harness updates accordingly. All other tasks survive.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use sspower:subagent-driven-development (recommended) or sspower:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add position lifecycle management (open, increase, decrease, close, flip) integrated with the OrderBook fill flow, plus a full liquidation engine (partial, full, insurance fund, ADL) and a Rust liquidation keeper bot. By the end, a trader can deposit, place orders, get matched into positions, see unrealized PnL, and be liquidated when undercollateralized.

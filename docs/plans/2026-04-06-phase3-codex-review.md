@@ -1,5 +1,8 @@
 # Phase 3 Codex Adversarial Review
 
+> **2026-04-22 Status:** Partially historical. Bug-fix reviews (C1, C2, m1) and FundingRate issues still apply to the Path B rebuild. MarketFactory / Router / OrderBook IOC/FOK review sections are obsolete under ADR-0012.
+
+
 **Date:** 2026-04-06
 **Scope:** Bug fixes C1/C2/m1 + Phase 3 implementation plan
 **Reviewer:** Codex (independent, no shared context with Claude)

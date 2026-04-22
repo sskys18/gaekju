@@ -1,5 +1,8 @@
 # Phase 1: Foundation & Core Orderbook — Implementation Plan
 
+> **2026-04-22 Status:** Partially superseded by Path B pivot (ADR-0012). Tasks 1, 5, 7, 8, 9, 13 survive (Vault, MarginEngine, OracleAdapter, test harness). Tasks 2 (BitmapLib), 3 (PackedOrder), 4 (TickMath), 10 (OrderBook), 11 (OrderBook integration tests) are obsolete — the resulting files will be deleted in contracts-v2 plan.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use sspower:subagent-driven-development (recommended) or sspower:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stand up the Gaekju project from scratch — Foundry contracts (libraries, Vault, OracleAdapter, MarginEngine, OrderBook with limit order matching) and a Rust types crate with ABI bindings. By the end a two-party deposit → place → match → fill flow works on Anvil.

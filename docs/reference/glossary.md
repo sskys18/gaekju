@@ -27,7 +27,10 @@ Key terms used throughout the Gaekju documentation.
 | **Maker** | A trader whose limit order rests on the book and adds liquidity. |
 | **Taker** | A trader whose order matches immediately and removes liquidity. |
 | **Fill** | A matched trade between a maker and taker order. |
-| **Bitmap** | Data structure where each bit represents a price tick's active status. Enables O(1) best price lookup. |
+| **Bitmap** | *(Legacy — removed in Path B pivot, see ADR-0012)* Data structure where each bit represents a price tick's active status. Enabled O(1) best price lookup in the original on-chain CLOB. |
+| **TickBitmap** | *(Legacy — removed in Path B pivot, see ADR-0012)* Per-market bitmap tracking occupied price ticks for the on-chain orderbook. |
+| **PackedOrder** | *(Legacy — removed in Path B pivot, see ADR-0012)* Bit-packed single-slot order struct (price, size, owner, flags) from the on-chain orderbook. |
+| **BitmapLib** | *(Legacy — removed in Path B pivot, see ADR-0012)* Solidity library implementing bitmap traversal (`findFirstSet` / `findLastSet`) for the on-chain orderbook. |
 
 ## Order Types
 
@@ -72,6 +75,19 @@ Key terms used throughout the Gaekju documentation.
 | **Alloy** | Rust library for Ethereum interaction. Successor to ethers-rs. |
 | **Foundry** | Solidity development toolkit (forge, cast, anvil). |
 | **OP Stack** | Open-source framework for building L2 rollups. Used by Giwa Chain. |
+
+## zkVM Matcher (Path B)
+
+| Term | Definition |
+|------|-----------|
+| **Sequencer** | Off-chain Rust matching engine (`crates/gaekju-sequencer`). Accepts signed EIP-712 intents, maintains orderbook state in memory, matches deterministically, emits fills. |
+| **Prover** | SP1 zkVM proving service (`crates/gaekju-prover`). Re-executes the Rust matching program over a batch of intents and produces a succinct proof of correct execution. |
+| **Batch** | Ordered set of intents matched by the sequencer, proven by the prover, and applied atomically by Settlement. Identified by a strictly monotonic batch nonce. |
+| **SP1** | Succinct Labs' zkVM. RISC-V-based, executes plain Rust, emits SNARK proofs verifiable on-chain at ~300k gas. Chosen over RISC Zero and Plonky2 (see ADR-0013). |
+| **Proof** | SNARK attestation from SP1 that a batch of intents was processed by the canonical Rust matching program, producing the committed state delta from the committed previous state root. |
+| **Settlement** | On-chain contract (`Settlement.sol`) that verifies the SP1 proof, decodes the state delta (fills, position updates, margin changes), and applies it to Vault / PositionManager / MarginEngine / FundingRate / LiquidationEngine. Replaces the legacy OrderBook as the sole caller of those modules. |
+| **Force-Include** | User escape hatch via `Router.forceInclude(intent)` on-chain. If the sequencer censors a user, Settlement must process their force-included intent within N batches or the sequencer is in default. See ADR-0014. |
+| **Soft-Confirm** | Sequencer-level acknowledgment of an accepted intent, returned in ~10-50ms, before on-chain finality (which waits for batch close + proof generation + Giwa block). |
 
 ## Markets
 

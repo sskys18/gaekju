@@ -2,6 +2,8 @@
 
 > Part 02 of "Building a Perp DEX from Scratch"
 
+> **2026-04-22 Retraction:** This post described the original Gaekju on-chain bitmap orderbook design. Under the Path B pivot (ADR-0012), matching moved off-chain to a Rust sequencer with SP1 zkVM proof of correctness. The bitmap orderbook code (BitmapLib, TickMath, PackedOrder, OrderBook.sol) has been deleted. Post preserved for historical reference on EVM bitmap orderbook design — the technique itself remains valid for spot CLOBs on EVM (cf. Clober on Base).
+
 ---
 
 Most DEX orderbooks are off-chain. The matching happens on a server, and only settlements land on-chain. We wanted Gaekju's matching to be fully on-chain — no trust assumptions beyond the L2 sequencer. The problem: iterating through price levels in Solidity is expensive. This post explains how we use bitmaps to make it practical.
