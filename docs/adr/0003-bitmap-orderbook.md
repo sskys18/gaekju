@@ -1,7 +1,9 @@
 # ADR-0003: Bitmap-Based Orderbook
 
 ## Status
-Accepted
+Superseded by ADR-0012 (2026-04-22)
+
+Historical context only. The Lighter-style on-chain EVM CLOB decision is reversed. See ADR-0012 for rationale.
 
 ## Date
 2026-04-06

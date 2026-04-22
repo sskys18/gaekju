@@ -14,7 +14,7 @@ The solution is to mirror liquidity from an existing production exchange. The mi
 The choice of mirror source determines which markets Gaekju can offer, how the mirrored depth behaves, and what API constraints the mirror agent operates under. The ideal source has broad market coverage (crypto, forex, commodities, equities), a free and unauthenticated API with WebSocket support for real-time updates, sufficient depth to create a realistic orderbook, and architectural similarity to Gaekju so that mirrored orders map naturally to the on-chain format.
 
 ## Decision
-Gaekju mirrors liquidity from Lighter.xyz. The `gaekju-mirror` crate connects to Lighter's public WebSocket API, subscribes to L2 orderbook snapshots and trade feeds for each configured market, and maintains a local representation of Lighter's book. On each update, it diffs the Lighter state against currently live mirror orders on Gaekju, then submits on-chain transactions to add, cancel, or update orders so that Gaekju's orderbook tracks Lighter's within approximately 2 seconds. Mirrored orders are placed from a dedicated mirror account with pre-funded USDC collateral and are tagged internally so the system can distinguish them from organic trader orders.
+Gaekju mirrors liquidity from Lighter.xyz. The `gaekju-mirror` crate connects to Lighter's public WebSocket API, subscribes to L2 orderbook snapshots and trade feeds for each configured market, and maintains a local representation of Lighter's book. On each update, it diffs the Lighter state against currently live mirror orders on Gaekju, then submits EIP-712-signed intents to the `gaekju-sequencer` REST/WS endpoint (introduced by ADR-0012) to add, cancel, or update orders so that Gaekju's orderbook tracks Lighter's within approximately 2 seconds. Before ADR-0012 the mirror submitted on-chain transactions calling `OrderBook.placeLimitOrder`; post-pivot it submits signed intents to the off-chain sequencer over HTTP/WebSocket. The EIP-712 signing scheme and Lighter-to-Gaekju market mapping are unchanged. Mirrored orders are placed from a dedicated mirror account with pre-funded USDC collateral and are tagged internally so the system can distinguish them from organic trader orders.
 
 ## Consequences
 ### Positive
@@ -29,7 +29,7 @@ Gaekju mirrors liquidity from Lighter.xyz. The `gaekju-mirror` crate connects to
 - Single point of dependency: if Lighter's API goes down or changes its format, Gaekju's testnet orderbooks go stale until the mirror agent is updated
 - Mirrored liquidity is not real: traders can take the other side of mirrored orders, but the mirror account's positions accumulate and must be managed (funded with sufficient testnet USDC, periodically reset)
 - Latency between Lighter's state change and Gaekju's on-chain reflection is 1-3 seconds due to API propagation, diff computation, and L2 transaction confirmation; fast-moving markets during high volatility may show stale prices briefly
-- The mirror account consumes block space with order placement and cancellation transactions, which on a low-throughput testnet could compete with organic trader transactions during peak load
+- Mirror load lands on the off-chain sequencer (post ADR-0012) rather than on-chain block space; on peak sequencer load the mirror and organic traders compete for matching queue depth, but no gas is consumed until batch settlement
 - Lighter's market parameters (tick sizes, lot sizes) constrain Gaekju's market configuration; deviating would require conversion logic in the mirror agent
 
 ## Alternatives Considered

@@ -7,16 +7,16 @@ Accepted
 2026-04-06
 
 ## Context
-Gaekju's on-chain CLOB requires several distinct pieces of logic: order matching, position tracking, margin calculations, liquidation, funding rates, oracle integration, collateral management, market creation, and a convenience router. The question is how to organize this logic across contracts.
+Gaekju's protocol requires several distinct pieces of logic: batch settlement (verifying SP1 proofs from the off-chain sequencer, per ADR-0012), position tracking, margin calculations, liquidation, funding rates, oracle integration, collateral management, market creation, and a convenience router. The question is how to organize this logic across contracts.
 
 The simplest approach is a single monolithic contract that does everything. This is how early DeFi protocols were built, but it runs into the EVM's 24KB contract size limit (EIP-170) quickly, and any change to one subsystem requires redeploying the entire protocol. The Diamond pattern (EIP-2535) allows a single address to delegate to multiple "facet" contracts that share storage, but this introduces tight coupling through shared storage slots and makes it harder to test and reason about individual components.
 
-The protocol has natural separation boundaries: the orderbook is stateful per market, the margin engine is pure computation, the liquidation engine orchestrates multiple components, and the vault is a simple accounting ledger. These boundaries suggest separate contracts that interact through well-defined interfaces.
+The protocol has natural separation boundaries: Settlement is the single on-chain entry point for proven batch state deltas, the margin engine is pure computation, the liquidation engine orchestrates multiple components, and the vault is a simple accounting ledger. These boundaries suggest separate contracts that interact through well-defined interfaces.
 
 ## Decision
-We use separate contracts per concern, each behind its own UUPS proxy. The contracts are: OrderBook (one per market, deployed by MarketFactory), PositionManager, MarginEngine, LiquidationEngine, FundingRate, OracleAdapter, Vault, MarketFactory, and Router. Each contract has a defined interface (IOrderBook, IPositionManager, etc.) and interacts with other contracts only through these interfaces.
+We use separate contracts per concern, each behind its own UUPS proxy. The contracts are: Settlement (proves-and-applies batches from the off-chain sequencer; replaces per-market OrderBook after ADR-0012), PositionManager, MarginEngine, LiquidationEngine, FundingRate, OracleAdapter, Vault, MarketFactory, and Router. Each contract has a defined interface (ISettlement, IPositionManager, etc.) and interacts with other contracts only through these interfaces. Note: the bitmap libraries (BitmapLib, PackedOrder, TickMath) were removed along with OrderBook.sol per ADR-0012; only FixedPointMath remains from the original library set.
 
-Authorization between contracts uses OpenZeppelin's AccessControl. Only the OrderBook can call PositionManager.updatePosition(). Only authorized contracts can call Vault.lockMargin(). The Router is a thin convenience layer that composes multi-step operations but holds no state.
+Authorization between contracts uses OpenZeppelin's AccessControl. Only Settlement can call PositionManager.updatePosition(). Only authorized contracts can call Vault.lockMargin(). The Router is a thin convenience layer that composes multi-step operations (including `forceInclude` per ADR-0014) but holds no state.
 
 ## Consequences
 ### Positive
