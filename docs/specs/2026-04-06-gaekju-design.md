@@ -1,9 +1,11 @@
 # Gaekju — Perpetual DEX Design Specification
 
-> **Status:** Revised (post-review)
-> **Date:** 2026-04-06
+> **Status:** Revised for Path B pivot (zkVM-proven off-chain matcher)
+> **Date:** 2026-04-06 (original) / 2026-04-22 (Path B revision)
 > **Chain:** Giwa Chain (OP Stack L2 Testnet)
 > **License:** MIT
+
+> **2026-04-22 NOTE:** This spec reflects the Path B pivot (ADR-0012). Sections related to on-chain matching (previously OrderBook.sol, bitmap libs) have been rewritten for the off-chain Rust matcher + SP1 zkVM + Settlement.sol architecture. Margin / position / liquidation / funding / oracle sections are unchanged from Phase 1+2 work.
 
 ---
 
@@ -19,33 +21,41 @@
 8. [Formulas & Math](#8-formulas--math)
 9. [Market Configurations](#9-market-configurations)
 10. [Security Considerations](#10-security-considerations)
+11. [Lighter Mirror + Testnet Traders](#11-live-market-operations--lighter-mirror--testnet-traders)
+12. [Sequencer Protocol](#13-sequencer-protocol)
+13. [Proof System](#14-proof-system)
+14. [Settlement Contract](#15-settlement-contract)
+15. [Soft-Confirm UX](#16-soft-confirm-ux)
+16. [Failure Modes](#17-failure-modes)
 
 ---
 
 ## 1. Overview
 
-Gaekju is a **production-grade perpetual futures DEX** deployed on Giwa Chain, an OP Stack L2 testnet. It follows the **Lighter.xyz architecture**: a fully on-chain central limit orderbook (CLOB) with bitmap-based price level encoding for gas efficiency.
+Gaekju is a **production-grade perpetual futures DEX** deployed on Giwa Chain, an OP Stack L2 testnet. It follows the **Lighter.xyz architecture family**: a central limit orderbook (CLOB) with matching executed by an off-chain Rust sequencer and correctness proven by an SP1 zkVM circuit. Settlement, collateral custody, position accounting, funding, and liquidation remain fully on-chain. See ADR-0012.
 
 ### Design Principles
 
-- **On-chain first:** All matching, position management, and risk checks happen in smart contracts. No trust assumptions beyond the L2 sequencer.
-- **Modular contracts:** Each concern (orderbook, margin, liquidation, funding) lives in its own contract. Independently upgradeable and testable.
-- **Rust backend as infrastructure:** The Rust codebase provides indexing, API serving, keeper bots, and SDK — it does not perform matching or risk decisions.
+- **Proven off-chain matching:** Matching runs in a deterministic Rust sequencer. An SP1 zkVM re-executes the same Rust over each batch and produces a succinct proof. The Settlement contract verifies the proof before applying the state delta. Logic trust reduces to on-chain contract trust; only ordering fairness is a residual trust axis (mitigated by force-inclusion and post-batch state-root commits).
+- **Modular on-chain contracts:** Each settlement concern (vault, margin, position, liquidation, funding, oracle) lives in its own upgradeable contract. Settlement is the sole caller.
+- **Rust as primary engine:** The matching engine, prover program, indexer, API, keeper, SDK, CLI, and Lighter mirror are all Rust. The sequencer and the SP1 guest share the same Rust crate.
 - **Documentation as a product:** Every phase produces ADRs, specs, changelog entries, and a blog post. The project is a tutorial as much as a product.
 
 ### What Gaekju Is
 
-- A fully on-chain perpetual futures exchange
-- Bitmap-based CLOB (Lighter model) on an OP Stack L2
+- A zkVM-proven perpetual futures exchange on an OP Stack L2
+- Off-chain Rust matcher + SP1 proof + on-chain settlement (Lighter architectural family)
 - Supports crypto perpetuals (BTC, ETH, SOL, etc.) and RWA perpetuals (EUR/USD, XAU/USD)
 - USDC-only collateral with isolated margin
 - Per-market configurable leverage (up to 50x crypto, 10x RWA)
 - Pyth Network oracle integration
+- Force-inclusion escape hatch: any user can submit an intent on-chain that the sequencer must process within N batches or be in default
 
 ### What Gaekju Is Not
 
 - Not an AMM or vAMM — this is a proper orderbook
-- Not an off-chain matching engine — all matching is on-chain
+- Not a fully on-chain EVM matching engine — matching is off-chain, proven, settled on-chain. See ADR-0012 rebuttal of ADR-0001
+- Not an optimistic/trust-me off-chain matcher — correctness is ZK-proven, not operator-asserted
 - Not cross-margin (in v1) — isolated margin only
 - Not a token launch — no governance token in scope
 
@@ -53,60 +63,122 @@ Gaekju is a **production-grade perpetual futures DEX** deployed on Giwa Chain, a
 
 ## 2. Architecture
 
+Gaekju is a three-layer system. Matching is off-chain (Layer 2, Rust sequencer). Correctness is proven (Layer 3, SP1 zkVM). Custody, position state, funding, and liquidation are on-chain (Layer 1, Giwa contracts). The Settlement contract is the bridge: it verifies SP1 proofs and applies matched-batch state deltas to the on-chain contracts.
+
 ### 2.1 System Overview
 
 ```
-                           ┌─────────────────────────────┐
-                           │      Giwa Chain (OP Stack)   │
-                           │                               │
-  Traders ──WebSocket───▶  │  ┌─────────────────────────┐ │
-  & REST API               │  │    Smart Contracts        │ │
-                           │  │                           │ │
-  ┌────────────────┐       │  │  MarketFactory            │ │
-  │  Rust Backend   │◀events│  │  ├─ OrderBook (per mkt)  │ │
-  │                 │       │  │  ├─ PositionManager       │ │
-  │  gaekju-indexer │       │  │  ├─ MarginEngine          │ │
-  │  gaekju-api     │──tx──▶│  │  ├─ LiquidationEngine    │ │
-  │  gaekju-keeper  │       │  │  ├─ FundingRate           │ │
-  │  gaekju-sdk     │       │  │  ├─ OracleAdapter (Pyth)  │ │
-  │  gaekju-cli     │       │  │  ├─ Vault (USDC)          │ │
-  └────────────────┘       │  │  └─ Router                 │ │
-                           │  └─────────────────────────┘ │
-                           └─────────────────────────────┘
+           Layer 1 — Giwa Chain (OP Stack L2)
+           ┌────────────────────────────────────────────────┐
+           │  Router (deposit / withdraw / forceInclude)    │
+           │  Settlement.sol (SP1 verifier + delta applier) │
+           │    ├─▶ Vault (USDC custody, 6↔18 dec)          │
+           │    ├─▶ PositionManager                          │
+           │    ├─▶ MarginEngine                             │
+           │    ├─▶ FundingRate                              │
+           │    ├─▶ LiquidationEngine                        │
+           │    └─▶ OracleAdapter (Pyth)                     │
+           └────────────────────────────────────────────────┘
+                      ▲                            ▲
+                      │ submit(batch, proof)       │ keeper tx
+                      │                            │ (liquidate,
+                      │                            │  applyFunding,
+                      │                            │  Pyth update)
+           ┌──────────┴──────────┐        ┌────────┴─────────┐
+           │ Layer 2 — Sequencer │        │   Rust Keepers    │
+           │  gaekju-sequencer   │        │ gaekju-keeper     │
+           │  (Rust, stateful)   │        └──────────────────┘
+           │  • EIP-712 intake   │
+           │  • Deterministic    │
+           │    matcher          │
+           │  • Emits batch blob │──────┐
+           │    + state delta    │      │ batch
+           └─────────────────────┘      │
+                      ▲                 ▼
+                      │ WS/REST    ┌─────────────────────┐
+                Signed│ intents    │ Layer 3 — Prover     │
+                      │            │  gaekju-prover       │
+           ┌──────────┴──────────┐ │  (Rust, SP1 zkVM)    │
+           │      Traders        │ │  • Re-runs matcher   │
+           │ (EIP-712 signer)    │ │    inside zkVM guest │
+           └─────────────────────┘ │  • Outputs SP1 proof │
+                                    │  • Public inputs:    │
+                                    │    prevRoot, batch,  │
+                                    │    postRoot          │
+                                    └──────────────────────┘
+
+Indexer/API/Frontend read events & pending state from both Settlement
+(finalized) and Sequencer (soft).
 ```
 
-### 2.2 Data Flow: Order Lifecycle
+### 2.2 Layer Responsibilities
+
+**Layer 1 — Giwa contracts (canonical state).**
+Vault custodies USDC. PositionManager owns positions. MarginEngine checks IMR/MMR. FundingRate accumulates per-interval premium. LiquidationEngine liquidates undermargined positions on-chain using Pyth mark price. OracleAdapter wraps Pyth. Settlement is the only authorized caller that can mutate positions / balances on behalf of user trading. Router exposes deposit/withdraw and a `forceInclude(intent)` escape hatch.
+
+**Layer 2 — Rust sequencer (`crates/gaekju-sequencer`).**
+Stateful service. Holds the authoritative pending orderbook in memory. Accepts EIP-712 signed intents over WS and REST. Enforces per-account monotonic nonces. Matches deterministically using price-time priority. Emits fills, position deltas, and margin deltas. Bundles a batch (ordered accepted intents + resulting fills + rejected intents + force-included intents observed on-chain) and hands it to the prover. Soft-acknowledges intents to users in <50ms.
+
+**Layer 3 — SP1 prover (`crates/gaekju-prover`).**
+Runs the same matching Rust crate inside the SP1 zkVM guest. Inputs: previous state root, batch blob, Pyth price attestations consumed by the batch. Outputs: new state root + succinct SP1 proof. Public inputs committed: `(prevStateRoot, batchHash, postStateRoot, batchNonce)`. Proof is posted to Settlement along with the batch blob.
+
+### 2.3 Data Flow: Order Lifecycle
 
 ```
-Trader                    Giwa L2                         Rust Backend
-  │                         │                                │
-  │── deposit USDC ────────▶│ Vault.deposit()                │
-  │                         │   └─ credit balance            │
-  │                         │                                │
-  │── place limit order ──▶│ Router.placeOrder()             │
-  │                         │   ├─ MarginEngine.check()      │
-  │                         │   ├─ OrderBook.insert()        │
-  │                         │   └─ emit OrderPlaced          │
-  │                         │                       ────────▶│ index event
-  │                         │                                │ update API
-  │                         │                                │
-  │                         │ (another trader's order matches)│
-  │                         │   ├─ OrderBook.match()         │
-  │                         │   ├─ PositionManager.updatePosition() │
-  │                         │   ├─ Vault.unlockOrderMargin() + lockMargin() │
-  │                         │   └─ emit OrderMatched, Fill   │
-  │                         │                       ────────▶│ index events
-  │                         │                                │ push WS update
-  │◀── position update ────│                                │
+Trader                 Sequencer (Rust)       Prover (SP1)        Settlement (Giwa)
+  │                         │                     │                     │
+  │── EIP-712 signed ─────▶│                      │                     │
+  │    intent (place)       │ verify sig + nonce  │                     │
+  │◀──── soft ack ────────│ match against book   │                     │
+  │  (fillHint, seqId)      │ emit pending fills  │                     │
+  │                         │                     │                     │
+  │                         │ close batch on      │                     │
+  │                         │ tick / size /       │                     │
+  │                         │ timeout             │                     │
+  │                         │──── batch + prevRoot ──▶                   │
+  │                         │                     │ re-execute in zkVM  │
+  │                         │                     │ produce SP1 proof   │
+  │                         │                     │── proof + blob ──▶ │
+  │                         │                     │                     │ verify SP1
+  │                         │                     │                     │ check nonce
+  │                         │                     │                     │ apply delta:
+  │                         │                     │                     │  Vault.applyBatchDelta
+  │                         │                     │                     │  PositionManager.applyBatchFills
+  │                         │                     │                     │ emit BatchFinalized
+  │◀──── finalized ───────│◀────────────────────│◀──────────────────│
 ```
 
-### 2.3 Data Flow: Liquidation
+Deposits and withdrawals go directly to Router → Vault and do not transit the sequencer. They update free balance, which the sequencer reads via on-chain state before accepting new intents.
+
+### 2.4 Data Flow: Force-Include (censorship escape)
+
+```
+Trader                  Router (Giwa)          Sequencer           Settlement
+  │                         │                      │                    │
+  │── forceInclude(intent) │                      │                    │
+  │── (on-chain tx) ──────▶│ emit IntentForced    │                    │
+  │                         │  (intent, deadline)  │                    │
+  │                         │                      │ observes event     │
+  │                         │                      │ includes in next   │
+  │                         │                      │ N batches          │
+  │                         │                      │                    │
+  │                         │                      │ if not included    │
+  │                         │                      │ before deadline:   │
+  │                         │                      │                    │ sequencer in default
+  │                         │                      │                    │ → pauseMatching / switchover
+```
+
+See ADR-0014 for force-inclusion deadline parameterization.
+
+### 2.5 Data Flow: Liquidation
+
+Liquidation runs entirely on-chain against the finalized state and Pyth mark price. It does not require a sequencer batch.
 
 ```
 Keeper (Rust)             Giwa L2
   │                         │
   │── isLiquidatable? ────▶│ LiquidationEngine.isLiquidatable()
-  │◀── true ───────────────│   └─ marginRatio < MMR
+  │◀── true ───────────────│   └─ marginRatio < MMR (finalized state)
   │                         │
   │── liquidate() ────────▶│ LiquidationEngine.liquidate()
   │                         │   ├─ FundingRate.settleFunding()
@@ -116,22 +188,15 @@ Keeper (Rust)             Giwa L2
   │                         │   └─ emit PositionLiquidated
 ```
 
+The sequencer observes on-chain liquidation events and reconciles its in-memory position view before accepting new intents for the affected account.
+
 ---
 
 ## 3. Smart Contracts
 
 ### 3.1 Libraries
 
-#### BitmapLib.sol
-Bitmap operations for price level tracking. Each bit represents whether orders exist at a given tick.
-
-- `setBit(bitmap, index)` — mark tick as having orders
-- `clearBit(bitmap, index)` — mark tick as empty
-- `findFirstSet(bitmap)` — find lowest tick with orders (best ask)
-- `findLastSet(bitmap)` — find highest tick with orders (best bid)
-- `isEmpty(bitmap)` — check if any bits are set
-
-Implementation: 256-bit words, with a two-level bitmap for markets with >256 ticks. First level indexes which 256-bit word has active ticks, second level is the actual tick bitmap.
+Only on-chain math libraries remain. Bitmap / packed-order / tick libraries are removed — orderbook state no longer lives on-chain. Tick arithmetic and order encoding move to the Rust matcher crate (`crates/gaekju-matcher`) which is shared between sequencer and SP1 guest.
 
 #### FixedPointMath.sol
 18-decimal fixed-point arithmetic. All prices, sizes, and rates use `uint256` with 18 decimals (1e18 = 1.0).
@@ -140,36 +205,6 @@ Implementation: 256-bit words, with a two-level bitmap for markets with >256 tic
 - `divFp(a, b) → a * 1e18 / b`
 - `mulDiv(a, b, c) → a * b / c` (full precision, no overflow)
 - Uses OpenZeppelin's `Math.mulDiv` for overflow-safe multiplication.
-
-#### PackedOrder.sol
-Pack order data into minimal storage slots.
-
-```
-Slot 0 (256 bits):
-  [0:159]   owner address (160 bits)
-  [160:191] orderId (32 bits)
-  [192:223] timestamp (32 bits)
-  [224:231] orderFlags (8 bits: side[1], orderType[3], reduceOnly[1], unused[3])
-  [232:255] reserved (24 bits)
-
-Slot 1 (256 bits):
-  [0:127]   price (128 bits, fixed-point 18 dec)
-  [128:255] size (128 bits, fixed-point 18 dec)
-```
-
-- `pack(order) → (bytes32, bytes32)`
-- `unpack(slot0, slot1) → Order`
-- `getPrice(slot1) → uint128`
-- `getSize(slot1) → uint128`
-- `getSide(slot0) → bool` (true = buy/long)
-
-#### TickMath.sol
-Convert between human-readable prices and tick indices.
-
-- `priceToTick(price, tickSize) → tickIndex`
-- `tickToPrice(tickIndex, tickSize) → price`
-- Tick index is an integer: `tickIndex = price / tickSize`
-- Example: BTC at $60,000 with tickSize $0.10 → tick 600,000
 
 ### 3.2 Vault
 
@@ -195,6 +230,17 @@ function unlockOrderMargin(address account, uint256 amount) external onlyAuthori
 function transferToInsuranceFund(uint256 amount) external onlyAuthorized;
 function drawFromInsuranceFund(uint256 amount) external onlyAuthorized;
 function realizePnl(address account, int256 pnl) external onlyAuthorized;
+
+// Batch settlement entry (Path B)
+// Applies a set of balance/margin deltas produced by a proven matching batch.
+// Caller guard: onlyRole(SETTLEMENT_ROLE). Settlement is the sole caller.
+// Idempotent within a batch: revert if batchNonce <= lastAppliedNonce.
+function applyBatchDelta(
+    uint256 batchNonce,
+    BalanceDelta[] calldata deltas
+) external onlyRole(SETTLEMENT_ROLE);
+// BalanceDelta { account, freeDelta, lockedMarginDelta, orderMarginDelta, realizedPnlDelta, insuranceFundDelta }
+// Sum of all deltas across a batch must satisfy fills-conservation invariant (§10).
 ```
 
 **USDC Decimal Conversion:**
@@ -238,124 +284,76 @@ Index price = Pyth spot oracle price (used for funding rate calculation).
 **Mark price calculation (v1):**
 ```
 oraclePrice = pyth.getPrice(marketId)
-midPrice = (bestBid + bestAsk) / 2   // from OrderBook, 0 if empty
+midPrice = sequencerMidPrice[marketId]   // published by each batch's state delta, 0 if batch carried no fills
 if midPrice == 0:
     markPrice = oraclePrice
 else:
     markPrice = oraclePrice * 0.7 + midPrice * 0.3  // oracle-weighted blend
 ```
-This ensures mark price and index price diverge when the orderbook trades away from oracle, producing non-zero funding rates. In v2, mark price uses a TWAP of this blend for smoothing.
 
-### 3.4 OrderBook
+**Sequencer mid-price pipeline.** Post ADR-0012 the orderbook lives off-chain in the sequencer. Each batch's `StateDelta` includes a `midPrice[marketId]` field that the sequencer computes as `(bestBid + bestAsk) / 2` at the moment the batch sealed. Settlement writes this value into a public `sequencerMidPrice` storage slot as part of `submitBatch`. OracleAdapter reads that slot when computing mark price. If the sequencer is halted and no new batch arrives, the stored mid-price decays to 0 after a staleness window (governance parameter, default 60 seconds) and the blend collapses to the oracle price.
 
-The core matching engine. One instance per market, deployed by MarketFactory.
+This ensures mark price and index price diverge when live trading drives the sequencer book away from oracle, producing non-zero funding rates. In v2, mark price uses a TWAP of this blend for smoothing.
 
-#### Storage Layout
+### 3.4 Settlement
 
-```solidity
-// Two-level bitmap for price levels
-// Level 0: which 256-bit words have active ticks
-uint256 public bidBitmapIndex;   // bitmap of active bid words
-uint256 public askBitmapIndex;   // bitmap of active ask words
-
-// Level 1: actual tick bitmaps (256 ticks per word)
-mapping(uint256 => uint256) public bidBitmaps;  // wordIndex → bitmap
-mapping(uint256 => uint256) public askBitmaps;
-
-// Orders at each tick (FIFO queue)
-mapping(uint256 => uint256) public bidHeadAtTick;  // tick → first orderId
-mapping(uint256 => uint256) public bidTailAtTick;  // tick → last orderId
-mapping(uint256 => uint256) public askHeadAtTick;
-mapping(uint256 => uint256) public askTailAtTick;
-
-// Order storage (packed)
-mapping(uint256 => bytes32) public orderSlot0;   // orderId → packed slot 0
-mapping(uint256 => bytes32) public orderSlot1;   // orderId → packed slot 1
-mapping(uint256 => uint256) public nextOrder;     // orderId → next in FIFO
-
-// Book state
-uint256 public bestBidTick;
-uint256 public bestAskTick;
-uint256 public nextOrderId;
-```
-
-#### Place Order Flow
-
-```
-placeOrder(side, price, size, orderType):
-  1. Validate: size >= minOrderSize, price aligned to tickSize
-  2. Calculate required margin: size * price / maxLeverage
-  3. MarginEngine.checkAndReserve(account, margin)
-  4. If orderType == MARKET:
-       matched = matchAgainst(oppositeSide, size)
-       if matched == 0: revert("no liquidity")
-       // Market orders fill what's available, like aggressive IOC
-       // Unfilled remainder is discarded (not resting on book)
-  5. If orderType == LIMIT:
-       matchable = tryMatch(oppositeSide, price, size)
-       if orderFlags.postOnly && matchable > 0: revert  // Post-Only check via flags
-       if matchable > 0: executeMatches(...)
-       remaining = size - matched
-       if remaining > 0: insertIntoBook(side, price, remaining)
-  6. If orderType == IOC:
-       matched = tryMatch(oppositeSide, price, size)
-       // discard unfilled portion
-  7. If orderType == FOK:
-       if canFullyFill(oppositeSide, price, size): executeMatches(...)
-       else: revert
-```
-
-#### Matching Algorithm
-
-```
-tryMatch(side, limitPrice, size):
-  remaining = size
-  if side == BUY:
-    tick = bestAskTick
-    while remaining > 0 && tick <= priceToTick(limitPrice):
-      orderId = askHeadAtTick[tick]
-      while orderId != 0 && remaining > 0:
-        makerOrder = unpack(orderId)
-        nextId = nextOrder[orderId]       // cache BEFORE potential removal
-        fillSize = min(remaining, makerOrder.size)
-        executeFill(maker, taker, tick, fillSize)
-        remaining -= fillSize
-        if makerOrder fully filled:
-          removeOrder(orderId)            // safe: nextId already cached
-          orderId = nextId
-        else:
-          updateOrderSize(orderId, makerOrder.size - fillSize)
-          break  // partial fill, this order stays at head
-      if tick is now empty: clearBit, advance to next ask tick
-    update bestAskTick
-  // mirror for SELL side
-  return size - remaining  // total matched
-```
-
-#### Fee Model
+Single on-chain contract that receives proven matching batches and applies them to Vault / PositionManager / MarginEngine / FundingRate. Replaces the old per-market OrderBook. See §15 for the deeper spec.
 
 ```solidity
-struct FeeConfig {
-    int256 makerFeeRate;    // -1e14 = -0.01% (negative = rebate)
-    int256 takerFeeRate;    //  5e14 = +0.05%
+contract Settlement {
+    ISp1Verifier public immutable verifier;   // SP1 Groth16/PLONK EVM verifier
+    bytes32 public immutable programVKey;     // commit to prover ELF / vkey
+    bytes32 public stateRoot;                 // current canonical state root
+    uint256 public batchNonce;                // strictly monotonic
+
+    // Primary entry
+    function submitBatch(
+        bytes calldata batchBlob,             // opaque ordered intents+fills+rejects
+        bytes32 postStateRoot,
+        bytes32 publicInputsHash,             // keccak(prevRoot, batchHash, postRoot, nonce)
+        bytes calldata sp1Proof
+    ) external onlyRole(SEQUENCER_ROLE);
+
+    // Force-include observation (populated by Router)
+    function forceIncludedIntents(uint256 intentId) external view returns (ForcedIntent memory);
+
+    // Admin
+    function pauseMatching() external onlyRole(GOVERNANCE);
+    function rotateSequencer(address next) external onlyRole(GOVERNANCE);
 }
-
-// Applied on each fill inside executeFill():
-//   notional = mulFp(fillSize, fillPrice)
-//   makerFee = mulFp(notional, makerFeeRate)  // negative → maker receives
-//   takerFee = mulFp(notional, takerFeeRate)  // positive → taker pays
-//   vault.realizePnl(maker, -makerFee)
-//   vault.realizePnl(taker, -takerFee)
-//   protocolRevenue += takerFee + makerFee    // always net positive
 ```
 
-#### Events
+**submitBatch flow (high-level):**
+1. Require `batchNonce + 1 == expectedNonce` decoded from public inputs (strict monotonicity).
+2. Require decoded `prevStateRoot == stateRoot` (no fork / replay).
+3. Require `programVKey` matches the proof's verifying key (prevents verifying a proof of the wrong program).
+4. Call `verifier.verifyProof(programVKey, publicInputsHash, sp1Proof)` — revert on false.
+5. Decode `batchBlob` into typed state deltas (balance deltas + fills + position deltas + forced-intent acks).
+6. For every force-included intent on the forced queue older than the deadline: require it is present in the batch (else revert; sequencer is in default).
+7. `Vault.applyBatchDelta(nextNonce, balanceDeltas)`
+8. `PositionManager.applyBatchFills(nextNonce, fills)`
+9. Update `stateRoot = postStateRoot`, `batchNonce += 1`.
+10. Emit `BatchFinalized(nonce, prevRoot, postRoot, batchHash, fillCount)`.
+
+**Invariants enforced here (see §10):** batch-nonce monotonicity, prev-state-root continuity, proof validity, force-inclusion deadline, fills conservation (decoded deltas sum to zero modulo insurance-fund delta).
+
+**Fees** are computed off-chain by the matcher and appear as realized-pnl components of the balance deltas. Maker rebate and taker fee rates are part of the proven program — changing them requires a programVKey update.
+
+**Events**
 
 ```solidity
-event OrderPlaced(uint256 indexed orderId, address indexed trader, uint256 indexed marketId, bool side, uint256 price, uint256 size, uint8 orderType);
-event OrderMatched(uint256 indexed marketId, uint256 makerOrderId, uint256 takerOrderId, uint256 price, uint256 size);
-event OrderCancelled(uint256 indexed orderId, address indexed trader);
-event Fill(uint256 indexed marketId, address indexed maker, address indexed taker, uint256 price, uint256 size, bool takerSide);
+event BatchFinalized(
+    uint256 indexed nonce,
+    bytes32 prevRoot,
+    bytes32 postRoot,
+    bytes32 indexed batchHash,
+    uint256 fillCount,
+    uint256 intentCount
+);
+event IntentForced(uint256 indexed intentId, address indexed trader, uint256 deadline);
+event IntentForcedResolved(uint256 indexed intentId, uint256 batchNonce);
+event SequencerRotated(address indexed next);
+event MatchingPaused(string reason);
 ```
 
 ### 3.5 MarginEngine
@@ -427,14 +425,24 @@ function getPositionHolders(uint256 marketId) external view returns (address[] m
 function getPositionCount(uint256 marketId) external view returns (uint256);
 // Updated automatically: added on position open, removed on position close
 
-// Called by OrderBook on fill
+// Called by Settlement on proven batch (Path B)
+// Role rebind: ORDERBOOK_ROLE → SETTLEMENT_ROLE. Semantics otherwise unchanged.
 function updatePosition(
     address account,
     uint256 marketId,
     int256 sizeDelta,     // positive = buy, negative = sell
     uint256 fillPrice,
     uint256 marginDelta
-) external onlyOrderBook;
+) external onlyRole(SETTLEMENT_ROLE);
+
+// Batch entry — applies many fills atomically with one caller check.
+// Each Fill is { account, marketId, sizeDelta, fillPrice, marginDelta, realizedPnl,
+// settledFunding }. Applied in order; funding is settled inline using the oracle
+// price snapshot committed by the batch's public inputs.
+function applyBatchFills(
+    uint256 batchNonce,
+    Fill[] calldata fills
+) external onlyRole(SETTLEMENT_ROLE);
 
 // View functions
 function getPosition(address account, uint256 marketId) external view returns (Position memory);
@@ -567,6 +575,8 @@ function settleFunding(address account, uint256 marketId) internal;
 
 ### 3.9 MarketFactory
 
+Thin config registry. Under Path B it no longer deploys per-market OrderBook proxies (there is no on-chain orderbook). It owns market metadata and pause flags. The sequencer reads this state to validate intents; Settlement reads it to reject batches that reference paused markets. Any change to tick/lot/leverage/IMR/MMR must be coordinated with a sequencer restart and prover vkey update if the matcher semantics depend on it.
+
 ```solidity
 struct MarketParams {
     string name;              // "BTC-USD"
@@ -583,7 +593,6 @@ struct MarketParams {
 }
 
 uint256 public nextMarketId;
-mapping(uint256 => address) public orderBooks;     // marketId → OrderBook address
 mapping(uint256 => MarketParams) public marketParams;
 mapping(uint256 => bool) public marketActive;
 
@@ -595,34 +604,30 @@ function updateMarketConfig(uint256 marketId, MarketParams calldata params) exte
 
 ### 3.10 Router
 
-Single entry point for common multi-step operations.
+Thin on-chain entry. Under Path B, users send signed intents (place/cancel/modify) off-chain to the sequencer. The Router only exposes operations that must live on-chain:
 
 ```solidity
-function depositAndPlaceOrder(
-    uint256 depositAmount,
-    uint256 marketId,
-    bool side,
-    uint256 price,
-    uint256 size,
-    uint8 orderType
-) external;
+// Deposit — 6→18 decimal conversion happens inside Vault.
+function deposit(uint256 usdcAmount) external;
 
-function cancelAllOrders(uint256 marketId) external;
+// Withdraw — limited to free (not locked / not order-reserved) balance.
+// May be delayed by pendingBatches: withdraw reverts until the sequencer has
+// committed a batch that acknowledges the user's intent freeze, to prevent
+// double-spend of in-flight margin.
+function withdraw(uint256 usdcAmount) external;
 
-function closePositionMarket(uint256 marketId) external;
-// Places a market order to fully close the position
+// Force-include escape hatch. Any user can submit a signed intent on-chain
+// if they suspect sequencer censorship. Settlement must include the intent
+// in one of the next N batches (ADR-0014 parameter) or the sequencer is in
+// default and matching is paused.
+function forceInclude(Intent calldata intent, bytes calldata signature) external;
+// Emits IntentForced(intentId, trader, block.timestamp + forceDeadline).
 
-function batchPlaceOrders(
-    uint256 marketId,
-    Order[] calldata orders
-) external;
-// For market makers: place multiple orders in one tx
-
-function batchCancel(
-    uint256 marketId,
-    uint256[] calldata orderIds
-) external;
+// Cancel a force-included intent before it is consumed (e.g. user changed mind).
+function cancelForcedInclude(uint256 intentId) external;
 ```
+
+Everything else — placeOrder, cancelOrder, modifyOrder, batch orders, post-only, reduce-only, IOC/FOK — is an off-chain signed intent, not a Router entry point.
 
 ### 3.11 Upgradability
 
@@ -918,17 +923,17 @@ loop {
 gaekju/
 ├── contracts/                    # Foundry project
 │   ├── src/
-│   │   ├── OrderBook.sol
+│   │   ├── Settlement.sol          # verifies SP1 proof, applies batch delta
 │   │   ├── PositionManager.sol
 │   │   ├── MarginEngine.sol
 │   │   ├── LiquidationEngine.sol
 │   │   ├── FundingRate.sol
 │   │   ├── OracleAdapter.sol
 │   │   ├── Vault.sol
-│   │   ├── MarketFactory.sol
-│   │   ├── Router.sol
+│   │   ├── MarketFactory.sol       # thin config registry
+│   │   ├── Router.sol              # deposit / withdraw / forceInclude
 │   │   ├── interfaces/
-│   │   │   ├── IOrderBook.sol
+│   │   │   ├── ISettlement.sol
 │   │   │   ├── IPositionManager.sol
 │   │   │   ├── IMarginEngine.sol
 │   │   │   ├── ILiquidationEngine.sol
@@ -937,10 +942,7 @@ gaekju/
 │   │   │   ├── IVault.sol
 │   │   │   └── IRouter.sol
 │   │   └── libraries/
-│   │       ├── BitmapLib.sol
-│   │       ├── FixedPointMath.sol
-│   │       ├── PackedOrder.sol
-│   │       └── TickMath.sol
+│   │       └── FixedPointMath.sol
 │   ├── test/
 │   │   ├── unit/
 │   │   ├── integration/
@@ -954,12 +956,15 @@ gaekju/
 │
 ├── crates/                       # Rust workspace
 │   ├── gaekju-types/
+│   ├── gaekju-matcher/             # deterministic matcher (shared with SP1 guest)
+│   ├── gaekju-sequencer/           # off-chain stateful matcher service
+│   ├── gaekju-prover/              # SP1 host + guest program
 │   ├── gaekju-indexer/
 │   ├── gaekju-api/
 │   ├── gaekju-keeper/
 │   ├── gaekju-sdk/
 │   ├── gaekju-cli/
-│   └── gaekju-mirror/              # Lighter liquidity mirror
+│   └── gaekju-mirror/              # Lighter liquidity mirror (targets sequencer)
 │
 ├── docs/
 │   ├── specs/
@@ -1103,264 +1108,88 @@ Blog publishing flow:
 
 ## 6. Build Phases (Final Detailed Version)
 
-### Phase 1: Foundation & Core Orderbook (Weeks 1-3)
+Phases 1–4 ran under Path A. They delivered Vault, OracleAdapter, MarginEngine, PositionManager, LiquidationEngine, and an on-chain OrderBook with 131 green tests. Under ADR-0012 the on-chain OrderBook, bitmap libs, and Phase 3 MarketFactory/Router/Advanced-Orders work are deleted. All other Phase 1–2 contracts survive with caller-guard rebind (ORDERBOOK_ROLE → SETTLEMENT_ROLE).
 
-#### 1.0 Project Setup
-- [ ] Initialize git repo, add LICENSE (MIT), README.md
-- [ ] Scaffold Foundry project in `contracts/`
-- [ ] Scaffold Rust workspace in `crates/` with all crate stubs
-- [ ] Set up CI: `forge test` + `cargo test` + `cargo clippy` + `forge fmt`
-- [ ] Create `docs/` directory structure
-- [ ] Write ADR-0001 through ADR-0009 (all initial decisions)
-- [ ] Write blog post #00: "Why We're Building Gaekju"
+The active forward plan is Phases 5–10 below. The historical Path A phase content is preserved in `docs/plans/archive/` for reference and is not reproduced here.
 
-#### 1.1 Solidity Libraries
-- [ ] `BitmapLib.sol` — implement + unit test all operations
-- [ ] `FixedPointMath.sol` — implement + fuzz test (check vs Python reference)
-- [ ] `PackedOrder.sol` — implement + round-trip fuzz test (pack → unpack == original)
-- [ ] `TickMath.sol` — implement + test edge cases (min/max tick, zero price)
+### Phase 5 — Contracts v2 (weeks 1–3 of pivot)
 
-#### 1.2 Vault Contract
-- [ ] Implement Vault with UUPS proxy
-- [ ] Unit tests: deposit, withdraw, balance checks, access control
-- [ ] Test: cannot withdraw more than balance
-- [ ] Test: only authorized contracts can lock/unlock margin
+Goal: on-chain contracts ready to receive proven batches.
 
-#### 1.3 OracleAdapter Contract
-- [ ] Integrate Pyth SDK
-- [ ] Implement price fetching with staleness + confidence checks
-- [ ] Unit tests with mock Pyth contract
-- [ ] Test: reverts on stale price
-- [ ] Test: reverts on wide confidence band
+- [ ] Delete `OrderBook.sol`, `IOrderBook.sol`, `BitmapLib.sol`, `TickMath.sol`, `PackedOrder.sol` and all OrderBook-coupled tests
+- [ ] Rebind caller guard on Vault, PositionManager, MarginEngine from `ORDERBOOK_ROLE` to `SETTLEMENT_ROLE`; update all surviving tests
+- [ ] Vault: add `applyBatchDelta(uint256 nonce, BalanceDelta[])`; unit + invariant tests
+- [ ] PositionManager: add `applyBatchFills(uint256 nonce, Fill[])`; retain per-fill path for liquidation; unit tests
+- [ ] Implement `Settlement.sol`: stateRoot, batchNonce monotonicity, SP1 verifier binding, programVKey commit, batch-blob decoder, force-include deadline check
+- [ ] Integrate a mock SP1 verifier for local testing (`MockSp1Verifier`) that accepts any proof
+- [ ] Update `Router.sol`: strip all order-placement entries; implement deposit/withdraw/forceInclude/cancelForcedInclude
+- [ ] MarketFactory: strip per-market OrderBook deployment; retain params registry + pause flags
+- [ ] Integration test: happy-path submitBatch with mock verifier drives Vault + PositionManager state correctly
+- [ ] Integration test: force-include deadline expiry pauses matching
+- [ ] Integration test: replay attempt (same nonce twice) reverts
+- [ ] Phase 5 wrap-up: blog post "Rewiring Gaekju for Proven Matching", tag v0.6.0
 
-#### 1.4 MarginEngine Contract (Basic)
-- [ ] Implement MarketConfig storage
-- [ ] Implement margin checks (initial margin, available margin)
-- [ ] Implement order margin reservation
-- [ ] Unit tests for each margin function
-- [ ] Fuzz test: margin calculations never overflow
+### Phase 6 — Sequencer (weeks 4–6)
 
-#### 1.5 OrderBook Contract (Limit Orders Only)
-- [ ] Implement bitmap storage layout
-- [ ] Implement order insertion (place limit order)
-- [ ] Implement matching algorithm (price-time priority)
-- [ ] Implement order cancellation
-- [ ] Unit test: place order → check book state
-- [ ] Unit test: two orders match → check fill events
-- [ ] Unit test: partial fill → check remaining size
-- [ ] Unit test: cancel → check margin released
-- [ ] Unit test: self-trade prevention (same account orders don't match)
-- [ ] Integration test: deposit → place bid → place ask (diff account) → match → check fill events + margin changes
-- [ ] Gas benchmark: place, match, cancel operations
-- [ ] Note: full position integration test deferred to Phase 2 (requires PositionManager)
+Goal: standalone Rust service accepts signed intents and emits deterministic batches.
 
-#### 1.6 Rust Types Crate
-- [ ] Define Order, Position, Market, Account types
-- [ ] Generate ABI bindings from Foundry artifacts using alloy
-- [ ] Event type definitions matching contract events
+- [ ] `crates/gaekju-matcher`: pure `no_std`-compatible Rust matcher — price-time priority, post-only/IOC/FOK/reduce-only, self-trade prevention, tick/lot enforcement, deterministic tie-break
+- [ ] Property tests on matcher (order-of-operations invariance under equivalent event sequences, no negative sizes, fills-conservation)
+- [ ] `crates/gaekju-sequencer`:
+  - [ ] EIP-712 intent type + verifier
+  - [ ] REST: POST /v1/intents, GET /v1/orderbook/{market}, GET /v1/account/{addr}/open
+  - [ ] WS: subscribe `orderbook`, `trades`, `user:{addr}` soft-ack stream
+  - [ ] Per-account monotonic nonce store (in-memory + WAL to disk)
+  - [ ] Batch builder: closes on max-intents / max-fills / max-time (parameterized)
+  - [ ] On-chain observer for forced-include intents; auto-injects into batch within deadline
+  - [ ] On-chain observer for liquidations / deposits / withdrawals; reconciles in-memory state
+- [ ] Integration test (in-memory chain via Anvil): sequencer accepts EIP-712 intent → emits batch → Settlement with mock verifier applies delta
+- [ ] Phase 6 wrap-up: blog post "Building a Deterministic Rust Matcher", tag v0.7.0
 
-#### 1.7 Phase 1 Wrap-up
-- [ ] Write blog post #01: "Choosing a Perp DEX Architecture"
-- [ ] Write blog post #02: "Building a Bitmap Orderbook"
-- [ ] Update CHANGELOG.md
-- [ ] Tag: v0.1.0
+### Phase 7 — Prover (weeks 7–9)
 
----
+Goal: real SP1 proofs of matcher execution over batch blobs.
 
-### Phase 2a: Position Management (Weeks 4-5)
+- [ ] `crates/gaekju-prover`:
+  - [ ] SP1 guest program wrapping `gaekju-matcher` — reads prevStateRoot, batch blob, Pyth attestations; writes postStateRoot
+  - [ ] Host runner: dispatches proof generation (local dev via `sp1-sdk` cpu, remote via Succinct Prover Network)
+  - [ ] Public inputs commitment: `keccak256(prevRoot || batchHash || postRoot || batchNonce)`
+  - [ ] Vkey export for Settlement bootstrap
+- [ ] Wire real SP1 verifier in `Settlement.sol` (swap out MockSp1Verifier)
+- [ ] Gas benchmark: real EVM verification target ≤ 350k gas per batch
+- [ ] End-to-end test: sequencer → prover → Settlement on local Anvil with real verifier
+- [ ] Phase 7 wrap-up: blog post "Proving the Matcher with SP1", tag v0.8.0
 
-#### 2a.1 PositionManager Contract
-- [ ] Implement Position struct and storage
-- [ ] Implement PositionRegistry (EnumerableSet of holders per market) for ADL
-- [ ] Implement updatePosition: new, increase, decrease, close, flip
-- [ ] Implement order margin → position margin conversion on fill
-- [ ] Implement unrealized PnL calculation (with mulFp normalization)
-- [ ] Implement margin ratio calculation (handle zero-notional case)
-- [ ] Unit tests for each position transition
-- [ ] Fuzz test: weighted average entry price calculation (verify mulFp precision)
-- [ ] Integration test: deposit → place → match → check positions + PnL
-- [ ] Integration test: multiple fills → correct entry price
+### Phase 8 — Indexer, API, Keeper (weeks 10–11)
 
-#### 2a.2 Indexer — Basic
-- [ ] Set up PostgreSQL schema (migrations via sqlx)
-- [ ] Implement block-by-block event fetching
-- [ ] Implement event decoding for all contract events
-- [ ] Implement reorg detection and rollback
-- [ ] Implement resumption from last indexed block
-- [ ] Integration test: index events from local Anvil
+Goal: external surface for users and ops.
 
-#### 2a.3 Phase 2a Wrap-up
-- [ ] Write blog post #03: "Margin Systems from Scratch"
-- [ ] Update CHANGELOG.md
-- [ ] Tag: v0.2.0
+- [ ] Indexer: add `BatchFinalized`, `IntentForced`, `SequencerRotated` event decoding; split pending (from sequencer WS) vs finalized (from Settlement events) state; reorg-safe
+- [ ] API: REST + WS as before, plus `GET /v1/batches/:nonce`, `GET /v1/proofs/:nonce`, `pending` vs `finalized` tags on all position/order views
+- [ ] Keeper: unchanged liquidation logic; add a watchdog that emits a metric when a force-included intent is approaching its deadline
+- [ ] SDK / CLI: user operations submit EIP-712 intents to the sequencer; only deposit/withdraw/forceInclude hit the chain directly
+- [ ] Phase 8 wrap-up: blog post "Soft-Confirm UX: Pending vs Finalized", tag v0.9.0
 
----
+### Phase 9 — Integration & hardening (weeks 12–13)
 
-### Phase 2b: Liquidation Engine (Weeks 6-7)
+- [ ] End-to-end load test: 500 intents/sec for 1 hour, measure batch cadence, proof latency, gas burn
+- [ ] Chaos: sequencer kill / restart, prover kill / restart, Giwa reorgs, Pyth stale feeds
+- [ ] Force-inclusion drill: simulate censorship, verify deadline triggers pause
+- [ ] Security review: Slither on contracts, `cargo audit` + `cargo deny` on crates, invariant campaign (§10)
+- [ ] Phase 9 wrap-up: tag v0.9.5
 
-#### 2b.1 LiquidationEngine Contract
-- [ ] Implement isLiquidatable check (with funding settlement first)
-- [ ] Implement partial liquidation logic (post-fee IMR targeting)
-- [ ] Implement full liquidation (when equity <= 0 or size < minOrderSize)
-- [ ] Implement per-market insurance fund + global insurance fund backstop
-- [ ] Implement dust position cleanup on partial liquidation
-- [ ] Unit test: liquidation at exactly MMR boundary
-- [ ] Unit test: partial liquidation restores margin to IMR after fees
-- [ ] Unit test: full liquidation when equity negative
-- [ ] Unit test: insurance fund absorbs deficit
-- [ ] Unit test: funding settled before liquidation check
+### Phase 10 — Testnet launch (weeks 14–16)
 
-#### 2b.2 ADL (Auto-Deleverage)
-- [ ] Implement ADL ranking using PositionRegistry.getPositionHolders()
-- [ ] Implement force-close logic against bankrupt positions
-- [ ] Implement loss waterfall: per-market fund → global fund → ADL → socialized loss
-- [ ] Unit test: ADL triggers when insurance fund empty
-- [ ] Scenario test: cascading liquidation chain → insurance depletion → ADL
+- [ ] Deploy Settlement + surviving contracts to Giwa testnet with real SP1 verifier
+- [ ] Deploy sequencer + prover on VPS; configure Succinct Prover Network endpoints
+- [ ] Deploy indexer/API/keeper
+- [ ] Seed markets via MarketFactory; spin up Lighter mirror pointed at sequencer
+- [ ] Faucet USDC; onboard first external traders
+- [ ] Phase 10 wrap-up: v1.0.0-testnet
 
-#### 2b.3 Liquidation Keeper
-- [ ] Implement position monitoring loop
-- [ ] Implement liquidation transaction submission
-- [ ] Implement nonce management for rapid txs
-- [ ] Implement gas price estimation
-- [ ] Integration test: position goes under margin → keeper liquidates
+### Historical Phases 1–5 (archived — Path A)
 
-#### 2b.4 Phase 2b Wrap-up
-- [ ] Write blog post #04: "Liquidation: Protecting the Protocol"
-- [ ] Update CHANGELOG.md
-- [ ] Tag: v0.3.0
-
----
-
-### Phase 3: Funding Rate, Markets & Advanced Orders (Weeks 8-9)
-
-#### 3.1 FundingRate Contract
-- [ ] Implement cumulative funding rate calculation
-- [ ] Implement funding settlement in PositionManager (with markPrice multiplication for USDC denomination)
-- [ ] Implement mark price blend: 70% oracle + 30% orderbook mid-price
-- [ ] Implement missed-interval catch-up logic (sequential application, not multiplier)
-- [ ] Unit test: positive/negative/zero/clamped funding
-- [ ] Unit test: funding settlement on position update
-- [ ] Integration test: hold position across 3 funding intervals
-
-#### 3.2 MarketFactory Contract
-- [ ] Implement market creation (deploys OrderBook proxy)
-- [ ] Implement market config management
-- [ ] Implement market pause/resume
-- [ ] Unit test: create market → trade → verify isolation
-- [ ] Define initial market configs (see Section 9)
-
-#### 3.3 Advanced Order Types
-- [ ] Implement Market order in OrderBook
-- [ ] Implement IOC (immediate-or-cancel)
-- [ ] Implement FOK (fill-or-kill)
-- [ ] Implement Post-Only
-- [ ] Implement Reduce-Only flag
-- [ ] Unit test for each order type + edge cases
-
-#### 3.4 Router Contract
-- [ ] Implement depositAndPlaceOrder
-- [ ] Implement cancelAllOrders
-- [ ] Implement closePositionMarket
-- [ ] Implement batchPlaceOrders
-- [ ] Implement batchCancel
-- [ ] Integration tests for all router functions
-
-#### 3.5 Funding Keeper
-- [ ] Implement funding rate trigger loop
-- [ ] Implement Pyth price update before funding
-- [ ] Integration test: keeper triggers funding on schedule
-
-#### 3.6 Phase 3 Wrap-up
-- [ ] Write blog post #05: "How Perp Funding Rates Actually Work"
-- [ ] Update CHANGELOG.md
-- [ ] Tag: v0.4.0
-
----
-
-### Phase 4: Rust Infrastructure Complete (Weeks 10-12)
-
-#### 4.1 API Server
-- [ ] Set up axum server with tower middleware (CORS, compression, rate limit)
-- [ ] Implement all REST endpoints (see Section 4.4)
-- [ ] Implement WebSocket handler with subscription management
-- [ ] Implement orderbook snapshot + incremental update streams
-- [ ] Implement trade stream
-- [ ] Implement position + order update streams
-- [ ] Integration tests against local stack
-- [ ] Write OpenAPI spec (docs/api/openapi.yaml)
-
-#### 4.2 SDK
-- [ ] Implement GaekjuClient (REST + contract interaction)
-- [ ] Implement WebSocket subscription client
-- [ ] Implement order builder helpers
-- [ ] Implement transaction signing + nonce management
-- [ ] Unit + integration tests
-- [ ] Rust doc comments on all public APIs
-
-#### 4.3 CLI
-- [ ] Implement admin commands (deploy, create-market, pause)
-- [ ] Implement trading commands (deposit, withdraw, buy, sell, cancel)
-- [ ] Implement info commands (orderbook, positions, markets, funding)
-- [ ] Add config file support (~/.gaekju/config.toml)
-
-#### 4.4 Docker & Monitoring
-- [ ] Dockerfiles for indexer, api, keeper
-- [ ] docker-compose.yml for full local stack
-- [ ] Prometheus metrics in API + keeper
-- [ ] Health check endpoints
-- [ ] Structured logging with tracing
-
-#### 4.5 Phase 4 Wrap-up
-- [ ] Write blog post #06: "Building an L2 Indexer in Rust"
-- [ ] Write blog post #07: "Keeper Bots: The Unseen Infrastructure"
-- [ ] Update CHANGELOG.md
-- [ ] Tag: v0.5.0
-
----
-
-### Phase 5: Testing, Security & Testnet Launch (Weeks 13-16)
-
-#### 5.1 Comprehensive Testing
-- [ ] Fuzz testing campaign: all math functions, position transitions
-- [ ] Invariant tests:
-  - Total vault balance >= sum of all account balances + insurance fund
-  - Sum of long open interest == sum of short open interest (per market)
-  - Every order in the book has reserved margin
-  - Orderbook is sorted (no crossed book)
-- [ ] Load test: simulate 100 concurrent traders via SDK
-- [ ] Scenario tests: market crash, all positions liquidated, ADL chain
-
-#### 5.2 Security Review
-- [ ] Run Slither static analysis, fix all findings
-- [ ] Reentrancy audit: check all external calls
-- [ ] Access control audit: verify all onlyAuthorized modifiers
-- [ ] Oracle manipulation audit: price staleness, confidence checks
-- [ ] Integer overflow audit (should be covered by Solidity 0.8+)
-- [ ] Write SECURITY.md with disclosure policy
-
-#### 5.3 Testnet Deployment
-- [ ] Write Foundry deployment scripts (CREATE2 deterministic)
-- [ ] Deploy all contracts to Giwa testnet
-- [ ] Verify contracts on block explorer
-- [ ] Deploy Rust backend (Docker on VPS)
-- [ ] Create initial markets (BTC, ETH, SOL, EUR, XAU)
-- [ ] Seed liquidity with market-making bot
-- [ ] Testnet USDC faucet
-
-#### 5.4 Documentation Completion
-- [ ] Getting started guide
-- [ ] Local development guide
-- [ ] Deployment guide
-- [ ] API documentation (REST + WebSocket)
-- [ ] Contributing guide
-- [ ] Glossary and formula reference
-
-#### 5.5 Phase 5 Wrap-up
-- [ ] Write blog post #08: "Fuzz Testing a DeFi Protocol"
-- [ ] Write blog post #09: "Deploying to an OP Stack Testnet"
-- [ ] Write blog post #10: "Lessons from Building a Perp DEX"
-- [ ] Update CHANGELOG.md
-- [ ] Tag: v1.0.0-testnet
+Phase 1 (Foundation & OrderBook), Phase 2a (Position Mgmt), Phase 2b (Liquidation), Phase 3 (Funding/Factory/Router/Advanced Orders), Phase 4 (Rust infra), Phase 5 (Testnet) as originally scoped are preserved in `docs/plans/archive/` and `docs/plans/2026-04-*-phase*.md` with pivot banners. Under ADR-0012 only the survivors listed above (Vault, OracleAdapter, MarginEngine, PositionManager, LiquidationEngine, FundingRate math) carry forward.
 
 ---
 
@@ -1368,15 +1197,21 @@ Blog publishing flow:
 
 | ADR | Decision | Key Rationale |
 |-----|----------|---------------|
-| 0001 | On-chain CLOB (Lighter model) | No off-chain trust assumptions, L2 makes gas feasible |
+| 0001 | ~~On-chain CLOB (Lighter model)~~ — **superseded by 0012** | EVM matching not economically viable for perp CLOB at scale |
 | 0002 | Modular contracts | Independent upgrades, clean testing, contract size limits |
-| 0003 | Bitmap orderbook | O(1) best price lookup, gas-efficient tick management |
+| 0003 | ~~Bitmap orderbook~~ — **superseded by 0012** | Orderbook state moves off-chain |
 | 0004 | Pyth Network oracle | Pull-based, sub-second updates, L2 native |
 | 0005 | USDC-only collateral | Simplifies accounting, no haircut calculations |
 | 0006 | Isolated margin (v1) | Simpler risk model, cross-margin in v2 |
-| 0007 | Rust for backend | Performance, type safety, alloy ecosystem |
+| 0007 | Rust for backend + matcher | Same crate runs in sequencer and SP1 guest |
 | 0008 | Alloy over ethers-rs | Actively maintained, better type generation |
-| 0009 | UUPS proxy pattern | Minimal gas overhead, clean upgrade path |
+| 0009 | UUPS proxy pattern | Clean upgrade path (gas argument no longer load-bearing) |
+| 0010 | Lighter mirror | Live depth for testnet; retargeted to sequencer endpoint |
+| 0011 | 1-hour funding interval | Matches Lighter; more responsive than 8h |
+| 0012 | zkVM-proven off-chain matcher | Three-layer architecture; supersedes 0001/0003 |
+| 0013 | SP1 zkVM framework | EVM verifier ~300k gas, Rust guest, Succinct prover network |
+| 0014 | Sequencer trust model + force-include | Bounded censorship latency; post-batch root commit |
+| 0015 | Proof batching and settlement cadence | Batch close on size/time; one proof per batch |
 
 ---
 
@@ -1568,10 +1403,19 @@ All markets are mirrored from Lighter.xyz. Leverage and margin configs follow Li
 - **Sequencer downtime:** Forced inclusion via L1 (standard OP Stack). On sequencer recovery, keepers catch up on missed liquidations and funding intervals.
 - **Missed funding intervals:** Keeper applies each missed interval sequentially. No catch-up multiplier — each uses the price at application time.
 
-### Orderbook Integrity
-- **Self-trade prevention:** Orders from the same account skip each other during matching.
-- **Crossed book recovery:** If bestBid >= bestAsk after an update (should never happen), halt the market and alert. This is a critical invariant.
-- **Quote stuffing mitigation:** Per-account rate limit on order placement (configurable, e.g., 100 orders/block).
+### Proven-Batch Integrity (Path B)
+
+The on-chain `bestBid < bestAsk` / `orderId → owner` / `TickBitmap` invariants of Path A are gone — there is no on-chain book to check. Settlement enforces a narrower set of invariants sufficient to make matching correctness equivalent to on-chain execution.
+
+- **Batch nonce strictly monotonic:** `submitBatch` requires `decodedNonce == stateBatchNonce + 1`. Enforced atomically with state-root update. No replay, no gaps, no reorder.
+- **Prev-state-root continuity:** Public inputs commit to `prevStateRoot`. Settlement rejects a proof whose `prevStateRoot` ≠ current `stateRoot`. Guarantees linear history.
+- **Proof validity + vkey binding:** `verifier.verifyProof(programVKey, publicInputsHash, sp1Proof)` must pass. `programVKey` is immutable at deploy time; changing the matcher requires governance-approved upgrade. Prevents "valid proof of wrong program."
+- **Public-inputs commitment:** `publicInputsHash == keccak256(prevRoot || batchHash || postRoot || batchNonce)`. Binds every decoded delta to the proof.
+- **Fills conservation:** for any batch, `Σ(balanceDelta.freeDelta) + Σ(lockedMarginDelta) + Σ(orderMarginDelta) + Σ(realizedPnlDelta) + insuranceFundDelta == 0`. Checked by Settlement after decoding. Any deviation rejects the batch.
+- **Force-inclusion bound:** for every `IntentForced(id, trader, deadline)` event older than the deadline, the next accepted batch must contain either an execution or a signed rejection for that intent. Else Settlement refuses the batch and calls `pauseMatching`.
+- **Self-trade prevention:** enforced inside the proven matcher program; a sequencer that produced a self-trade would fail to prove.
+- **Per-account nonce monotonicity:** each intent carries a monotonic per-account nonce; the matcher rejects stale or duplicate nonces, and the proof commits to this.
+- **Pyth attestation binding:** any mark-price or index-price used by matcher (e.g., reduce-only checks against oracle) is committed by its Pyth attestation inside the batch's public inputs.
 
 ### Testing Requirements
 - 100% branch coverage on all contracts
@@ -1583,7 +1427,9 @@ All markets are mirrored from Lighter.xyz. Leverage and margin configs follow Li
 
 ## 11. Live Market Operations — Lighter Mirror + Testnet Traders
 
-Gaekju connects to **Lighter.xyz** as its liquidity source. Lighter has 220+ perpetual markets including crypto, forex, and commodities — all with free unauthenticated API access. Real Lighter orderbook depth is mirrored onto Gaekju's on-chain book. Testnet users trade against this real-world depth, and their orders coexist with the mirrored orders on the same on-chain orderbook.
+> **Path B note (2026-04-22):** The mirror design below is unchanged in intent but retargeted. Under ADR-0012 there is no on-chain OrderBook. The mirror agent now submits EIP-712 signed intents to the Rust sequencer's `POST /v1/intents` endpoint (same EOA signing, different nonce scheme — per-account monotonic instead of chain nonce). All references below to "Gaekju on-chain orderbook", "Router.batchPlaceOrders", "batch_cancel" contracts, and "tx inclusion" should be read as "sequencer intents, soft-acked in <50ms, finalized on batch proof." The Lighter mirror's behavior (diff + scale + submit) is otherwise identical and remains in Phase 10 (testnet launch) of the revised plan.
+
+Gaekju connects to **Lighter.xyz** as its liquidity source. Lighter has 220+ perpetual markets including crypto, forex, and commodities — all with free unauthenticated API access. Real Lighter orderbook depth is mirrored onto Gaekju. Testnet users trade against this real-world depth through the sequencer, and their intents coexist with the mirrored intents in the same matching book.
 
 **Why Lighter as the mirror source:**
 - Gaekju follows Lighter's architecture — same on-chain CLOB model
@@ -2222,6 +2068,280 @@ Fee system tasks (added to Phase 3):
 
 ---
 
+## 13. Sequencer Protocol
+
+The sequencer (`crates/gaekju-sequencer`) is a stateful Rust service. It accepts signed intents, matches them against its in-memory book, soft-acknowledges users in <50ms, and bundles ordered batches for the prover.
+
+### 13.1 Transport
+
+**REST** (for one-off intents, admin, health):
+- `POST /v1/intents` — body: `{ intent, signature }`. Returns `{ seqId, softAck | rejection }`.
+- `GET /v1/orderbook/:marketId?depth=N` — current pending book (not yet finalized).
+- `GET /v1/account/:addr` — pending + finalized balances, open intents, nonces.
+- `GET /v1/batches?from=nonce&limit=N` — batch metadata (status: building / proving / submitted / finalized).
+- `GET /health`, `GET /metrics`.
+
+**WebSocket** (for low-latency trader flow):
+- `ws://sequencer.gaekju/ws`
+- Client sends `{ method: "submit", intent, signature }` — server responds with `{ seqId, softAck }`.
+- Server streams channels on subscribe: `orderbook:{market}`, `trades:{market}`, `user:{addr}` (pending fills, finalizations), `batches` (batch open/close/prove/submit events).
+
+### 13.2 Intent format (EIP-712)
+
+```
+Domain:
+  name            = "Gaekju"
+  version         = "1"
+  chainId         = <giwa chain id>
+  verifyingContract = <Settlement address>
+
+Types:
+  Intent = {
+    kind:        uint8,      // 0=place, 1=cancel, 2=modify
+    trader:      address,
+    marketId:    uint256,
+    side:        uint8,      // 0=buy, 1=sell  (placement only)
+    orderType:   uint8,      // 0=limit,1=market,2=ioc,3=fok,4=postOnly
+    reduceOnly:  bool,
+    price:       uint128,    // 18-dec (0 for market)
+    size:        uint128,    // 18-dec
+    refSeqId:    uint128,    // cancel/modify target
+    nonce:       uint64,     // per-account monotonic
+    expiry:      uint64,     // unix seconds
+  }
+```
+
+The trader signs `Intent` with their EOA key. Sequencer verifies the signature and per-account nonce before accepting.
+
+### 13.3 Nonce scheme
+
+Per-account monotonic: `intent.nonce == account.lastAcceptedNonce + 1`. Gaps are rejected. The sequencer persists accepted nonces to a write-ahead log before replying with a soft-ack; on crash-restart it replays the WAL to rebuild state.
+
+Per-account nonces are independent of Giwa chain nonces (used for deposit/withdraw/forceInclude).
+
+### 13.4 Ordering semantics
+
+- FIFO inside a single market at the same price; no reordering.
+- Across markets, intents are stamped with a global `seqId` (u64 monotonic) assigned on acceptance.
+- Matching is deterministic: price-time priority using `seqId` as the time tiebreaker.
+- The sequencer commits to NOT reordering user intents inside a batch. This is a trust assumption, bounded by:
+  - force-inclusion deadline (ADR-0014)
+  - post-batch state-root commitment makes reordering observable after the fact
+  - rotating sequencer set (future work)
+
+### 13.5 Batch lifecycle
+
+A batch closes when any of:
+- `batch.intentCount >= MAX_INTENTS_PER_BATCH` (default 4096)
+- `batch.fillCount  >= MAX_FILLS_PER_BATCH` (default 8192)
+- `now() - batch.openedAt >= MAX_BATCH_AGE` (default 5s)
+- `forceInclude` intent is within `FORCE_DEADLINE - SAFETY_MARGIN` of its deadline
+
+On close: sequencer hands the batch blob + prevStateRoot + Pyth attestations to the prover. Sequencer continues accepting intents into the next batch in parallel.
+
+---
+
+## 14. Proof System
+
+The prover (`crates/gaekju-prover`) re-executes the matcher crate inside SP1 zkVM (ADR-0013) and emits a succinct proof.
+
+### 14.1 Circuit inputs
+
+**Private (witness):**
+- Full prev-state snapshot sufficient to recompute the state root (positions, balances, open-intent book).
+- Pyth price attestations referenced by the batch (verified against their signers inside the zkVM).
+- The batch blob (ordered intents + force-included intents).
+
+**Public (committed):**
+- `prevStateRoot`  — bytes32
+- `batchHash`      — keccak256 of the canonical batch encoding
+- `postStateRoot`  — bytes32
+- `batchNonce`     — uint256
+
+### 14.2 Public inputs commitment
+
+Settlement computes `expectedPublicHash = keccak256(abi.encode(prevStateRoot, batchHash, postStateRoot, batchNonce))` from its own state + caller-supplied batch. The SP1 verifier checks this commitment against the proof. Any mismatch rejects.
+
+### 14.3 Output format
+
+The prover host outputs:
+```
+struct ProofBundle {
+    bytes32 postStateRoot;
+    bytes32 batchHash;
+    uint256 batchNonce;
+    bytes   sp1Proof;      // ~260 bytes Groth16 or ~1KB PLONK
+    bytes   batchBlob;     // decodable by Settlement
+}
+```
+
+### 14.4 EVM verifier gas target
+
+Target: **≤ 350k gas** per `submitBatch` end-to-end (proof verify + delta decode + contract calls). SP1 Groth16 verifier is ~230k gas; decode + apply is the remaining budget. Benchmarked in Phase 7.
+
+### 14.5 Prover infrastructure
+
+- **Local dev:** `sp1-sdk` CPU prover.
+- **Testnet:** Succinct Prover Network (hosted). Cost ~$0.01–$1 per batch in 2026, trending down.
+- **Failure modes:** see §17.
+
+---
+
+## 15. Settlement Contract
+
+Deeper spec for the contract summarized in §3.4.
+
+### 15.1 Interface
+
+```solidity
+interface ISettlement {
+    function submitBatch(
+        bytes calldata batchBlob,
+        bytes32 postStateRoot,
+        bytes32 publicInputsHash,
+        bytes calldata sp1Proof
+    ) external;
+
+    function stateRoot() external view returns (bytes32);
+    function batchNonce() external view returns (uint256);
+    function programVKey() external view returns (bytes32);
+
+    // Force-include view
+    function pendingForcedIntent(uint256 intentId) external view returns (
+        address trader, bytes32 intentDigest, uint256 deadline, bool resolved
+    );
+
+    // Governance
+    function pauseMatching(string calldata reason) external;
+    function unpauseMatching() external;
+    function rotateSequencer(address next) external;
+    function setProgramVKey(bytes32 next) external;  // timelocked
+}
+```
+
+### 15.2 Batch blob encoding
+
+Canonical layout:
+```
+BatchBlob = abi.encode(
+    Header { uint256 nonce, bytes32 prevRoot, uint64 timestamp, uint32 intentCount, uint32 fillCount },
+    Intent[]  acceptedIntents,    // replayed for pending-state clients
+    Fill[]    fills,               // applied via PositionManager.applyBatchFills
+    BalanceDelta[] balanceDeltas,  // applied via Vault.applyBatchDelta
+    ForcedAck[] forcedAcks,        // ack of on-chain force-included intents
+    bytes32[] attestedPriceIds,    // pyth price ids referenced
+    bytes32[] attestedPriceHashes  // commitment to Pyth VAAs used
+)
+```
+
+### 15.3 State delta application
+
+Order of operations inside `submitBatch` (after SP1 verify):
+1. Decode `Header`; assert `header.nonce == batchNonce + 1`, `header.prevRoot == stateRoot`.
+2. Decode balance deltas; compute `Σ` and assert fills-conservation (§10).
+3. For every decoded `ForcedAck`, mark the corresponding `pendingForcedIntent.resolved = true`.
+4. Check: for every pending forced intent where `now > deadline`, it must be in `forcedAcks`. Else revert.
+5. `Vault.applyBatchDelta(header.nonce, balanceDeltas)` — atomic write.
+6. `PositionManager.applyBatchFills(header.nonce, fills)` — atomic write.
+7. Update `stateRoot = postStateRoot`, `batchNonce = header.nonce`.
+8. Emit `BatchFinalized`.
+
+### 15.4 Caller guards on downstream contracts
+
+Every downstream contract (`Vault`, `PositionManager`) gates its batch entry point with `onlyRole(SETTLEMENT_ROLE)`. The role is assigned at deploy time to the Settlement proxy address and changed only via Timelock governance. `ORDERBOOK_ROLE` is removed.
+
+LiquidationEngine retains its own role (`LIQUIDATOR_ROLE` held by keeper EOAs). MarginEngine, FundingRate, OracleAdapter expose only view + keeper paths to external callers.
+
+### 15.5 Programs and upgrades
+
+`programVKey` is immutable once set at deployment. Upgrading the matcher program (bug fix, new feature) requires:
+1. Timelocked `setProgramVKey(newVKey)` proposal.
+2. During the timelock, sequencer may continue accepting intents proved against the old vkey.
+3. At timelock expiry, an atomic upgrade batch switches vkey; intents proved against old vkey are rejected thereafter.
+4. Any pending force-included intents are carried across; their deadlines do not reset.
+
+---
+
+## 16. Soft-Confirm UX
+
+Users experience three confidence levels:
+
+| State | Latency | Backed by | Reversible? |
+|-------|---------|-----------|-------------|
+| **Soft-ack** | <50ms (sequencer response) | Sequencer signature + WAL | Yes — only if sequencer drops offline before batch submit and never recovers (very unlikely); force-include hatches intents through |
+| **Batch closed** | ~5s (matches Giwa block cadence) | Sequencer committed batch to prover | No for matching logic (committed); yes for on-chain state (not yet applied) |
+| **Finalized** | ~30s–2min (proof gen + Giwa inclusion) | SP1 proof + Settlement tx | No (fully on-chain) |
+
+**UX patterns (Phase 8):**
+- Trade history panel shows soft-acked fills with a pending indicator; it flips to finalized on `BatchFinalized` with matching seqId.
+- Balance panel shows "available + pending" broken out. Withdrawals use available only.
+- On sequencer disconnect: client warns "matching paused"; user can still read on-chain state and use force-include.
+- Wallet popups for deposit / withdraw / force-include still look like normal tx flows; all other actions are off-chain signature prompts.
+
+**SLAs (Phase 10 targets):**
+- Soft-ack p95 < 50ms regional, < 200ms global.
+- Batch close p95 < 6s.
+- Batch finalization p95 < 2 min (dominated by Succinct Prover Network latency).
+- Force-include deadline: 30 min (configurable via ADR-0014).
+
+---
+
+## 17. Failure Modes
+
+### 17.1 Sequencer halt
+
+Symptom: sequencer stops accepting or stops batching.
+
+- Traders cannot submit new intents through normal path.
+- Traders can use `Router.forceInclude(intent)` for up to `FORCE_DEADLINE` worth of in-flight trades.
+- If halt persists past deadline, Settlement rejects the next attempted batch (forced-inclusion invariant fires) → `pauseMatching("force_timeout")` emits.
+- Governance rotates sequencer via `rotateSequencer(next)`; force-include queue carries across.
+- Existing positions continue to accrue funding and remain liquidatable on-chain (liquidation path does not require sequencer).
+
+### 17.2 Prover halt
+
+Symptom: sequencer emits batches but no proofs are produced.
+
+- Soft-acks keep flowing (users can still open/close).
+- Finalization stalls; on-chain state does not update.
+- Batch backlog grows in sequencer WAL. Bounded by disk.
+- Liquidations still work from last finalized state.
+- Mitigation: redundant provers (local + Succinct network). If both fail, ops rolls the sequencer back to the last finalized batch; soft-acked-but-unproved intents are dropped and replayed.
+- User-facing: "finalization delayed" banner.
+
+### 17.3 Proof invalid (verifier revert)
+
+Symptom: `submitBatch` reverts with `Sp1VerifyFailed`.
+
+- The offending batch never finalizes on-chain.
+- Sequencer is in an inconsistent state (its soft book diverged from what the prover proved).
+- Response: sequencer pauses, rewinds its in-memory state to last finalized batch, replays the WAL against the matcher, re-proves.
+- If repro: the matcher is buggy or the prover is misconfigured — investigate out-of-band. Governance may `setProgramVKey` after fix.
+
+### 17.4 Batch reversion on L1
+
+Symptom: `submitBatch` tx reverts for reasons other than verifier (e.g., nonce mismatch after a Giwa reorg).
+
+- Sequencer detects revert in `BatchFinalized` event absence past expected block.
+- Re-reads `stateRoot` and `batchNonce` from Settlement.
+- If current on-chain nonce is behind sequencer's assumption: resubmit the batch with refreshed `prevStateRoot`.
+- If current on-chain nonce is ahead (another submitter somehow landed a batch): pause, investigate — this should only happen if multiple sequencers are mistakenly authorized.
+
+### 17.5 Pyth oracle degraded
+
+- Mark price stale or confidence wide → OracleAdapter reverts.
+- Sequencer enters cancel-only mode per market (reject new openings; allow closes).
+- Liquidations pause (on-chain `isLiquidatable` reverts on stale).
+- Funding skipped until oracle returns.
+
+### 17.6 Giwa L2 outage
+
+- Standard OP Stack: force-inclusion via L1 after sequencer grace window.
+- Off-chain matching continues; finalization defers.
+- Withdrawals delayed until L2 resumes.
+
+---
+
 ## Appendix: Glossary
 
 | Term | Definition |
@@ -2238,3 +2358,11 @@ Fee system tasks (added to Phase 3):
 | **TWAP** | Time-Weighted Average Price |
 | **UUPS** | Universal Upgradeable Proxy Standard (EIP-1822) |
 | **RWA** | Real-World Assets (forex, commodities, indices) |
+| **Sequencer** | Rust service that accepts signed intents, matches, and emits batches |
+| **Prover** | SP1 zkVM service that proves matcher execution over a batch |
+| **SP1** | Succinct Labs' RISC-V zkVM used as the proving target |
+| **Batch** | Ordered set of accepted intents + resulting fills + forced-intent acks |
+| **Intent** | EIP-712-signed user order (place/cancel/modify) |
+| **Settlement** | On-chain contract that verifies SP1 proofs and applies batch state deltas |
+| **Soft-ack** | Sequencer-signed acknowledgment before on-chain finalization |
+| **Force-include** | On-chain escape hatch for censored intents |
