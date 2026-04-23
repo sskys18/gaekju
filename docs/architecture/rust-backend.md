@@ -4,7 +4,7 @@
 
 ```
 crates/
-├── gaekju-types/       — Shared types, ABI bindings (alloy), batch/intent/fill formats
+├── gaekju-types/       — Shared types, alloy ABI bindings, canonical batch/intent/fill formats
 ├── gaekju-sequencer/   — Off-chain matching engine, WS/REST API, EIP-712 verify, batch emitter
 ├── gaekju-prover/      — SP1 guest program + host prover service, proof submission to Settlement
 ├── gaekju-indexer/     — Reads sequencer stream + on-chain Settlement events → PostgreSQL
@@ -29,9 +29,16 @@ The matching engine. Authoritative orderbook state lives here.
 
 ### gaekju-prover (new)
 SP1 guest program + host service.
-- Guest: re-executes the sequencer's matching state machine over a batch. Public inputs: `prevStateRoot`, `postStateRoot`, batch commitment, market id, chain id.
-- Host: drives proving (local or Succinct prover network), submits `(batch, proof)` to `Settlement.submitBatch` on Giwa.
+- Guest: re-executes the sequencer's matching state machine over a batch. Public inputs are the canonical `BatchPublicInputs` struct — `(prevStateRoot, postStateRoot, batchHash, batchNonce, chainId, forceIncludeCursor)` per design spec §14.1. `marketId` is **not** a public input (fills carry their own `marketId`).
+- Host: drives proving (local or Succinct prover network), submits a `ProofBundle` to `Settlement.applyBatch` on Giwa (spec §15.1).
 - Handles prover retries, proof cache, cost accounting.
+
+### gaekju-types
+Single source of truth for cross-crate wire compatibility.
+- Alloy bindings for `Settlement`, `Router`, `Vault`, `PositionManager`, `FundingRate`, `LiquidationEngine`, and `MarketFactory`.
+- Canonical Rust mirrors of `BatchPublicInputs`, `ProofBundle`, `BatchBlob`, `BatchHeader`, `Fill`, `BalanceDelta`, `MidPriceUpdate`, `ForcedOutcome`, and the signed-intent payload used by both sequencer intake and `Router.forceInclude`.
+- Event decoders for `BatchSettled`, `ForceIncludeQueued`, `ForcedIntentResolved`, plus surviving deposit / withdraw / funding / liquidation events.
+- Encoding helpers/tests that prove Rust `abi_encode()` matches Solidity tuple order exactly for `ProofBundle` and `BatchBlob`; this is load-bearing for SP1 public-input verification and `keccak256(abi.encode(BatchBlob))`.
 
 ### gaekju-indexer
 Reads two streams:
@@ -45,7 +52,7 @@ Reconciles the two so API can serve consistent state at any confirmation level.
 - `pending / sealed / final` state exposed per order / fill.
 
 ### gaekju-keeper
-Liquidation and funding bots. Unchanged logic; target address changes from OrderBook to Settlement / LiquidationEngine / FundingRate (Settlement address wired via `MarketFactory` registry).
+Liquidation and funding bots. Unchanged logic; target address changes from OrderBook to Settlement / LiquidationEngine / FundingRate (core addresses come from the bootstrap deploy output, not from `MarketFactory` market config rows).
 
 ### gaekju-mirror
 Unchanged purpose, new target. Writes signed EIP-712 intents to the sequencer REST/WS endpoint instead of calling `OrderBook.placeLimitOrder`. Signing, nonce discipline, and rate limiting match a normal trader account.
@@ -59,7 +66,7 @@ Endpoint targets updated:
 ## Dependency Flow
 
 ```
-gaekju-types ← used by everything (intent, batch, fill, ABI bindings, matching state-machine lib)
+gaekju-types ← used by everything (intent, batch, fill, ABI bindings, event decoders, matching state-machine lib)
 
 gaekju-sequencer ← admits intents, matches, emits batches
 gaekju-prover    ← consumes batches from sequencer, produces proofs, submits to Settlement

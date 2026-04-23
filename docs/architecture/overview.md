@@ -40,7 +40,7 @@ The matching engine. Accepts signed EIP-712 intents over WS/REST, maintains the 
 SP1 zkVM re-executes the same Rust matching program over each batch and produces a succinct proof. Proof plus batch is submitted to Settlement on Giwa. Prover cost and latency dominate end-to-end finality (~30s-2min per batch).
 
 ### Settlement (on-chain, Solidity)
-`Settlement.sol` (per market) verifies the SP1 proof, checks batch nonce monotonicity, decodes the state delta, and applies it to the surviving contracts — Vault, PositionManager, MarginEngine, FundingRate, LiquidationEngine, OracleAdapter. Settlement is the sole privileged caller (`SETTLEMENT_ROLE`) of those contracts in place of the deleted OrderBook. See [contracts.md](contracts.md).
+`Settlement.sol` (single global instance) verifies the SP1 proof, checks batch nonce monotonicity, decodes the state delta, and applies it to the surviving contracts — Vault, PositionManager, MarginEngine, FundingRate, LiquidationEngine, OracleAdapter. A single batch can span multiple markets; Settlement is the sole privileged caller (`SETTLEMENT_ROLE`) of those contracts in place of the deleted OrderBook. See [contracts.md](contracts.md).
 
 ## Key Design Principles
 

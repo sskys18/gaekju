@@ -5,12 +5,12 @@ Matching lives off-chain in the Rust sequencer; on-chain contracts verify SP1 pr
 ## Contract Map
 
 ```
-MarketFactory
-├── Settlement (one per market)       — SP1 proof verifier, batch decoder, state applier
-├── PositionManager                    — Position lifecycle, PnL, registry
+MarketFactory (config-only, no contract deploys per market)
+Settlement         (global, single instance)  — SP1 proof verifier, multi-market batch decoder, state applier
+├── PositionManager                    — Position lifecycle, PnL, registry (all markets)
 ├── MarginEngine                       — Margin checks, market configs
 ├── LiquidationEngine                  — Liquidation, insurance fund, ADL
-├── FundingRate                        — Hourly funding calculation
+├── FundingRate                        — Hourly funding calculation (per-market state, single contract)
 ├── OracleAdapter                      — Pyth price feeds, mark/index price
 ├── Vault                              — USDC deposits, collateral accounting
 └── Router                             — deposit / withdraw / forceInclude
@@ -23,15 +23,16 @@ Libraries:
 
 ## Settlement.sol
 
-Per-market contract, sole caller of Vault / PositionManager / MarginEngine / FundingRate (via `SETTLEMENT_ROLE`).
+**Global singleton** — one contract instance for the entire exchange. A single batch can contain fills across any number of markets; each `Fill` carries its own `marketId`. There is no per-market Settlement proxy. Settlement is the sole caller of Vault / PositionManager / MarginEngine / FundingRate (via `SETTLEMENT_ROLE`). Rationale: one sequencer, one proven state machine, one batch chain, one force-include queue. Per-market settlement would fragment the nonce chain, the force-include queue, and the proof cadence for no safety gain.
 
 **Responsibilities:**
-- Verify the SP1 proof against the committed public inputs (`prevStateRoot`, `postStateRoot`, batch commitment, market id, chain id).
-- Enforce batch nonce strictly monotonic (`nonce[n+1] == nonce[n] + 1`, no gaps, no replays).
+- Verify the SP1 proof against canonical `BatchPublicInputs` — `(prevStateRoot, postStateRoot, batchHash, batchNonce, chainId, forceIncludeCursor)`. See design spec §14.1 for the canonical struct; there is no `marketId` in public inputs (batches can contain fills across multiple markets; `marketId` lives per-`Fill` inside the blob).
+- Enforce batch nonce strictly monotonic (`nonce[n+1] == nonce[n] + 1`, no gaps, no replays) and `chainId == block.chainid` (prevents cross-chain/fork replay).
 - Anchor `prevStateRoot` to the previously accepted `postStateRoot` so batches chain.
-- Decode the state delta: accepted intents, rejected intents, fills (taker/maker, price, size), position updates, margin unlocks, funding settlements.
-- Dispatch deltas to Vault (collateral moves), PositionManager (position mutations), MarginEngine (invariant checks), FundingRate (cumulative funding index advances).
-- Enforce force-inclusion SLA: intents accepted via `Router.forceInclude` must be processed (filled or rejected) within N batches; otherwise the sequencer is in default and Settlement refuses further batches until the queue clears.
+- Decode the state delta: accepted intents, fills, balance deltas, `ForcedOutcome[]` (accepted-with-fill OR rejected-with-reason-code — the sequencer cannot claim "resolved" without the prover running the intent through the circuit).
+- Dispatch deltas to Vault (all collateral / margin / PnL / funding-payment moves — Vault is the single owner under Path B) and PositionManager (position state only, no inline `vault.*` mutations). See design spec §15.3.1 for the Vault/PositionManager split rationale + equivalence test gate.
+- Enforce force-inclusion SLA: for every queue entry whose `deadlineBatchNonce <= batchNonce`, the batch must contain a proved `ForcedOutcome`. Else `applyBatch` reverts with `ForcedIntentOverdue` — Settlement refuses further batches until governance clears the queue (ADR-0014, design spec §15.3).
+- Support `programVKey` rotation via pause-and-drain procedure (spec §15.5) — `proposeProgramVKey` + timelock + `activateProgramVKey` (requires `paused() == true` and prover queue drained). Rejected alternatives: immutable vkey + Settlement redeploy; dual-vkey grace window.
 
 ## Contract Interactions
 
@@ -39,12 +40,13 @@ Per-market contract, sole caller of Vault / PositionManager / MarginEngine / Fun
 User → Router.deposit / withdraw → Vault
 User → Router.forceInclude(intent) → Settlement (queued for next batch)
 
-Sequencer → Prover → Settlement.submitBatch(batch, proof)
-                      ├─ SP1 verify
-                      ├─ PositionManager.applyBatchFills(...)
-                      ├─ Vault.applyBatchDelta(...)
-                      ├─ MarginEngine.check(...)
-                      └─ FundingRate.advance(...)
+Sequencer → Prover → Settlement.applyBatch(ProofBundle)
+                      ├─ SP1 verify + chainId + nonce/prevRoot
+                      ├─ ForcedOutcome liveness check (queue deadlines)
+                      ├─ Vault.applyBatchDelta(...)            — sole writer of vault buckets
+                      ├─ PositionManager.applyBatchFills(...)  — position state only
+                      ├─ MarginEngine.check(...)               — invariant asserts
+                      └─ emit BatchSettled(nonce, prevRoot, postRoot, batchHash, cursor)
 
 Keeper → LiquidationEngine.liquidate()
            ├─ FundingRate.settleFunding()
@@ -69,7 +71,7 @@ All contracts use UUPS proxy (EIP-1822):
 - Batch nonce strictly monotonic; no gaps, no replays
 - `postStateRoot = f(prevStateRoot, batch)` proven by SP1; submitted `prevStateRoot` equals previously accepted `postStateRoot`
 - Fills sum conservation: `Σ(taker collateral Δ) + Σ(maker collateral Δ) + insuranceΔ + feeΔ = 0` per batch
-- Force-included intents processed within N batches (default configurable per market)
+- Force-included intents processed within N batches (global `FORCE_INCLUDE_N`, default 3; configurable via timelocked governance — not per-market)
 - Position holders tracked in EnumerableSet for ADL
 - Only `SETTLEMENT_ROLE` may mutate Vault / PositionManager / MarginEngine / FundingRate state deltas
 
@@ -77,7 +79,7 @@ All contracts use UUPS proxy (EIP-1822):
 
 ## MarketFactory
 
-Deploys one Settlement proxy per market, wires the Settlement address into the shared Vault / PositionManager / MarginEngine / FundingRate as an authorized caller. No OrderBook deployment.
+Config-only registry under the global Settlement model. `MarketFactory.createMarket(params)` registers a `marketId` + `MarketParams` (tick, lot, IMR, MMR, funding interval, Pyth price id, caps, fees) into on-chain storage read by Settlement during `applyBatch`. No per-market contract deployment — Settlement, Vault, PositionManager, MarginEngine, LiquidationEngine, FundingRate, OracleAdapter are deployed once at bootstrap. Markets can be paused individually by flipping `marketActive[marketId]`.
 
 ## Router
 
