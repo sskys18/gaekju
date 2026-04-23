@@ -144,7 +144,7 @@ Trader                 Sequencer (Rust)       Prover (SP1)        Settlement (Gi
   │                         │                     │                     │ apply delta:
   │                         │                     │                     │  Vault.applyBatchDelta
   │                         │                     │                     │  PositionManager.applyBatchFills
-  │                         │                     │                     │ emit BatchFinalized
+  │                         │                     │                     │ emit BatchSettled
   │◀──── finalized ───────│◀────────────────────│◀──────────────────│
 ```
 
@@ -156,7 +156,7 @@ Deposits and withdrawals go directly to Router → Vault and do not transit the 
 Trader                  Router (Giwa)          Sequencer           Settlement
   │                         │                      │                    │
   │── forceInclude(intent) │                      │                    │
-  │── (on-chain tx) ──────▶│ emit IntentForced    │                    │
+  │── (on-chain tx) ──────▶│ emit ForceIncludeQueued                    │
   │                         │  (intent, deadline)  │                    │
   │                         │                      │ observes event     │
   │                         │                      │ includes in next   │
@@ -291,70 +291,88 @@ else:
     markPrice = oraclePrice * 0.7 + midPrice * 0.3  // oracle-weighted blend
 ```
 
-**Sequencer mid-price pipeline.** Post ADR-0012 the orderbook lives off-chain in the sequencer. Each batch's `StateDelta` includes a `midPrice[marketId]` field that the sequencer computes as `(bestBid + bestAsk) / 2` at the moment the batch sealed. Settlement writes this value into a public `sequencerMidPrice` storage slot as part of `submitBatch`. OracleAdapter reads that slot when computing mark price. If the sequencer is halted and no new batch arrives, the stored mid-price decays to 0 after a staleness window (governance parameter, default 60 seconds) and the blend collapses to the oracle price.
+**Sequencer mid-price pipeline (single source of truth).** The orderbook lives off-chain in the sequencer. Each `BatchBlob` carries a dedicated `MidPriceUpdate[] midPriceUpdates` top-level array — one entry per market touched by the batch — with `mid = (bestBid + bestAsk) / 2` at the instant the batch sealed. `MidPriceUpdate` is **not** part of `BalanceDelta[]`; it is a sibling array in the blob because it mutates FundingRate state, not Vault state. Inside `applyBatch` (§15.3 step 9b) Settlement itself calls `FundingRate.updateSequencerMid(marketId, mid)` for each entry — Settlement holds `SETTLEMENT_ROLE` on FundingRate, Vault does not need FundingRate access. This writes `sequencerMid[marketId]` + `sequencerMidTimestamp[marketId] = block.timestamp`. Two consumers read this slot:
+
+1. **OracleAdapter mark price (above):** if `block.timestamp - sequencerMidTimestamp <= 60s`, use the fresh mid in the 70/30 blend; otherwise collapse to pure oracle.
+2. **FundingRate.applyFunding** (§3.8): same 60s staleness rule, pure-oracle fallback, emits `FundingFellBackToOracle` on fallback.
+
+The 60s staleness window is the single governance parameter (`SEQUENCER_MID_STALENESS`) shared across both consumers. If the sequencer is halted, both mark-for-margin and funding converge to pure oracle after 60s — no silent staleness, no dual-path divergence.
 
 This ensures mark price and index price diverge when live trading drives the sequencer book away from oracle, producing non-zero funding rates. In v2, mark price uses a TWAP of this blend for smoothing.
 
 ### 3.4 Settlement
 
-Single on-chain contract that receives proven matching batches and applies them to Vault / PositionManager / MarginEngine / FundingRate. Replaces the old per-market OrderBook. See §15 for the deeper spec.
+**Global singleton.** Single on-chain contract that receives proven matching batches for **all markets** and applies them to Vault / PositionManager / MarginEngine / FundingRate. A single batch can span any number of markets; each `Fill` and each `BalanceDelta` carries its own `marketId`. One batch-nonce chain, one force-include queue, one `programVKey` for the whole exchange. Replaces the old per-market OrderBook family. See §15 for the deeper spec.
+
+Catalog entry — full spec in §15. Canonical types: §14.1 (`BatchPublicInputs`) and §15.2 (`BatchBlob`).
 
 ```solidity
 contract Settlement {
-    ISp1Verifier public immutable verifier;   // SP1 Groth16/PLONK EVM verifier
-    bytes32 public immutable programVKey;     // commit to prover ELF / vkey
-    bytes32 public stateRoot;                 // current canonical state root
-    uint256 public batchNonce;                // strictly monotonic
+    ISP1Verifier public verifier;        // upgradable via UUPS
+    bytes32      public programVKey;     // storage slot, rotated via pause+drain (§15.5)
+    bytes32      public stateRoot;
+    uint64       public batchNonce;
+    uint64       public forceIncludeCursor;
 
-    // Primary entry
-    function submitBatch(
-        bytes calldata batchBlob,             // opaque ordered intents+fills+rejects
-        bytes32 postStateRoot,
-        bytes32 publicInputsHash,             // keccak(prevRoot, batchHash, postRoot, nonce)
-        bytes calldata sp1Proof
-    ) external onlyRole(SEQUENCER_ROLE);
+    function applyBatch(ProofBundle calldata bundle) external;
 
-    // Force-include observation (populated by Router)
-    function forceIncludedIntents(uint256 intentId) external view returns (ForcedIntent memory);
+    function forceIncludedIntents(uint256 intentId)
+        external view returns (ForcedIntent memory);
 
-    // Admin
-    function pauseMatching() external onlyRole(GOVERNANCE);
-    function rotateSequencer(address next) external onlyRole(GOVERNANCE);
+    // Governance (timelock + multisig)
+    function pauseMatching(string calldata reason) external;
+    function unpauseMatching() external;
+    function rotateSequencer(address next) external;
+    function proposeProgramVKey(bytes32 next) external;
+    function activateProgramVKey(bytes32 next) external;  // paused + drained only
 }
 ```
 
-**submitBatch flow (high-level):**
-1. Require `batchNonce + 1 == expectedNonce` decoded from public inputs (strict monotonicity).
-2. Require decoded `prevStateRoot == stateRoot` (no fork / replay).
-3. Require `programVKey` matches the proof's verifying key (prevents verifying a proof of the wrong program).
-4. Call `verifier.verifyProof(programVKey, publicInputsHash, sp1Proof)` — revert on false.
-5. Decode `batchBlob` into typed state deltas (balance deltas + fills + position deltas + forced-intent acks).
-6. For every force-included intent on the forced queue older than the deadline: require it is present in the batch (else revert; sequencer is in default).
-7. `Vault.applyBatchDelta(nextNonce, balanceDeltas)`
-8. `PositionManager.applyBatchFills(nextNonce, fills)`
-9. Update `stateRoot = postStateRoot`, `batchNonce += 1`.
-10. Emit `BatchFinalized(nonce, prevRoot, postRoot, batchHash, fillCount)`.
+**applyBatch flow (high level — full version §15.3):**
+1. Decode `bundle.batchBlob` → `blob`; check `keccak256(blob) == bundle.publicInputs.batchHash` + `chainId == block.chainid`.
+2. `bundle.publicInputs.batchNonce == batchNonce + 1` and `prevStateRoot == stateRoot`.
+3. SP1 verify `(programVKey, abi.encode(BatchPublicInputs), sp1Proof)`.
+4. For every overdue entry in the force-include queue, require a proved `ForcedOutcome`; else revert.
+5. Store `ForcedOutcome` data into each queue entry; emit `ForcedIntentResolved`.
+6. `Vault.applyBatchDelta(nonce, blob.balanceDeltas)` — sole writer of vault buckets.
+7. `PositionManager.applyBatchFills(nonce, blob.fills)` — position state only.
+8. `stateRoot = postStateRoot; batchNonce = newNonce; forceIncludeCursor = newCursor;`.
+9. Emit `BatchSettled(...)`.
 
-**Invariants enforced here (see §10):** batch-nonce monotonicity, prev-state-root continuity, proof validity, force-inclusion deadline, fills conservation (decoded deltas sum to zero modulo insurance-fund delta).
+**Invariants enforced here (see §10):** batch-nonce monotonicity, prev-state-root continuity, chain-id binding, proof validity, force-inclusion deadline via proved outcomes, fills conservation (decoded deltas sum to zero modulo insurance + fees).
 
-**Fees** are computed off-chain by the matcher and appear as realized-pnl components of the balance deltas. Maker rebate and taker fee rates are part of the proven program — changing them requires a programVKey update.
+**Fees** are computed off-chain by the matcher and appear as `BalanceDelta` entries. Maker rebate and taker fee rates are part of the proven program — changing them requires a `programVKey` rotation (§15.5).
 
-**Events**
+**Events (canonical, no aliases):**
 
 ```solidity
-event BatchFinalized(
-    uint256 indexed nonce,
-    bytes32 prevRoot,
-    bytes32 postRoot,
-    bytes32 indexed batchHash,
-    uint256 fillCount,
-    uint256 intentCount
+event BatchSettled(
+    uint64  indexed batchNonce,
+    bytes32         prevStateRoot,
+    bytes32         postStateRoot,
+    bytes32         batchHash,
+    uint64          forceIncludeCursor
 );
-event IntentForced(uint256 indexed intentId, address indexed trader, uint256 deadline);
-event IntentForcedResolved(uint256 indexed intentId, uint256 batchNonce);
+event ForceIncludeQueued(
+    uint256 indexed forcedIntentId,
+    address indexed trader,
+    bytes32         intentHash,
+    uint64          deadlineBatchNonce
+);
+event ForcedIntentResolved(
+    uint256 indexed forcedIntentId,
+    uint8           outcome,       // 1 = accepted, 2 = rejected
+    uint8           rejectReason,
+    bytes32         resultHash
+);
 event SequencerRotated(address indexed next);
+event ProgramVKeyProposed(bytes32 indexed vkey, uint64 timelockExpiresAt);
+event ProgramVKeyRotated(bytes32 indexed oldVKey, bytes32 indexed newVKey);
 event MatchingPaused(string reason);
+event MatchingUnpaused();
 ```
+
+Older names (`BatchApplied`, `BatchFinalized`, `IntentForced`, `IntentForcedResolved`) are retracted — use the above exclusively.
 
 ### 3.5 MarginEngine
 
@@ -450,56 +468,56 @@ function getUnrealizedPnl(address account, uint256 marketId) external view retur
 function getPositionValue(address account, uint256 marketId) external view returns (uint256);
 ```
 
-Position update logic:
+**Position update logic (runs inside the zkVM matcher, not on-chain).** Under Path B, this pseudocode describes the deterministic Rust state machine that the sequencer executes for soft-confirm and the SP1 guest re-executes for the proof. It lives in `crates/gaekju-matching-core`. Each call emits (a) one or more `Fill` records for `PositionManager.applyBatchFills`, and (b) a set of `BalanceDelta` records (order-margin release, position-margin lock, realized-PnL credit/debit, funding payment) that the prover packs into `blob.balanceDeltas` and `Vault.applyBatchDelta` applies. Settlement's `PositionManager.applyBatchFills` on-chain only writes position state (§15.3.1); it does **not** call `vault.*` methods inline.
+
 ```
-updatePosition(account, market, sizeDelta, fillPrice, marginDelta):
-  pos = positions[account][market]
-  settleFunding(account, market)  // settle accumulated funding first
+// Runs inside matching-core (Rust). NOT an on-chain function under Path B.
+applyFill(state, account, market, sizeDelta, fillPrice, orderMarginForThisFill):
+  pos = state.positions[account][market]
+  settleFunding(state, account, market)   // emits BalanceDelta for funding payment
 
   if pos.size == 0:
-    // New position
-    pos.size = sizeDelta
-    pos.entryPrice = fillPrice
-    pos.collateral = marginDelta
+    pos.size, pos.entryPrice, pos.collateral = sizeDelta, fillPrice, orderMarginForThisFill
+    state.balanceDeltas.push(UnlockOrderMargin(account, orderMarginForThisFill))
+    state.balanceDeltas.push(LockPositionMargin(account, orderMarginForThisFill))
 
   else if sameDirection(pos.size, sizeDelta):
-    // Increase position — weighted average entry
     newSize = pos.size + sizeDelta
     pos.entryPrice = (mulFp(pos.entryPrice, abs(pos.size)) + mulFp(fillPrice, abs(sizeDelta))) * 1e18 / abs(newSize)
     pos.size = newSize
-    pos.collateral += marginDelta
-
-  // On every fill: release order margin, convert to position margin
-  vault.unlockOrderMargin(account, orderMarginForThisFill)
+    pos.collateral += orderMarginForThisFill
+    state.balanceDeltas.push(UnlockOrderMargin(account, orderMarginForThisFill))
+    state.balanceDeltas.push(LockPositionMargin(account, orderMarginForThisFill))
 
   else if abs(sizeDelta) < abs(pos.size):
     // Partial close — realize PnL
     pnl = mulFp(fillPrice - pos.entryPrice, abs(sizeDelta)) * sign(pos.size)
-    vault.realizePnl(account, pnl)
+    state.balanceDeltas.push(RealizePnl(account, pnl))
     pos.size += sizeDelta
-    proportionalCollateral = pos.collateral * abs(sizeDelta) / abs(pos.size)
+    proportionalCollateral = pos.collateral * abs(sizeDelta) / abs(pos.size_before)
     pos.collateral -= proportionalCollateral
-    vault.unlockMargin(account, proportionalCollateral)
+    state.balanceDeltas.push(UnlockPositionMargin(account, proportionalCollateral))
 
   else if abs(sizeDelta) == abs(pos.size):
-    // Full close
     pnl = mulFp(fillPrice - pos.entryPrice, abs(pos.size)) * sign(pos.size)
-    vault.realizePnl(account, pnl)
-    vault.unlockMargin(account, pos.collateral)
-    delete positions[account][market]
+    state.balanceDeltas.push(RealizePnl(account, pnl))
+    state.balanceDeltas.push(UnlockPositionMargin(account, pos.collateral))
+    delete state.positions[account][market]
 
   else:
     // Flip — close old + open new in opposite direction
     closePnl = mulFp(fillPrice - pos.entryPrice, abs(pos.size)) * sign(pos.size)
-    vault.realizePnl(account, closePnl)
-    vault.unlockMargin(account, pos.collateral)
-    remainingSize = sizeDelta + pos.size  // opposite sign
-    newMargin = mulFp(abs(remainingSize), fillPrice) * IMR  // margin for new direction
-    vault.lockMargin(account, newMargin)
-    pos.size = remainingSize
-    pos.entryPrice = fillPrice
-    pos.collateral = newMargin
+    state.balanceDeltas.push(RealizePnl(account, closePnl))
+    state.balanceDeltas.push(UnlockPositionMargin(account, pos.collateral))
+    remainingSize = sizeDelta + pos.size
+    newMargin = mulFp(abs(remainingSize), fillPrice) * IMR
+    state.balanceDeltas.push(LockPositionMargin(account, newMargin))
+    pos.size, pos.entryPrice, pos.collateral = remainingSize, fillPrice, newMargin
+
+  state.fills.push(Fill { account, market, sizeDelta, fillPrice, ... })
 ```
+
+On-chain, `PositionManager.applyBatchFills(fills)` walks `fills` and writes only `(size, entryPrice, collateral, lastCumulativeFunding)` + the `_positionHolders` set. It reads `vault.*` only for invariant assertions (MMR check on decrease-into-loss, IMR check on open/increase) — **never** to mutate. See §15.3.1.
 
 ### 3.7 LiquidationEngine
 
@@ -543,24 +561,43 @@ function autoDeleverage(uint256 marketId, address bankruptAccount) external;
 
 ### 3.8 FundingRate
 
+Per Path B, the **mark price used for funding is the sequencer orderbook mid-price**, written on-chain by Settlement during each batch via a dedicated `MidPriceUpdate[]` array in the `BatchBlob` (sibling to `balanceDeltas`, see §15.2). Settlement itself calls `FundingRate.updateSequencerMid(marketId, mid)` — the call is `onlyRole(SETTLEMENT_ROLE)`, granted once at bootstrap. Rationale for using sequencer mid: funding should track perpetual trading price, not purely oracle price, matching Lighter / Hyperliquid convention. The oracle remains authoritative for margin / liquidation (§3.5, §3.7).
+
 ```solidity
 struct FundingState {
-    int256 cumulativeFundingRate;  // accumulated funding rate (18 dec)
-    uint256 lastFundingTime;       // last update timestamp
-    uint256 fundingInterval;       // 1 hour = 3600 seconds (matches Lighter)
-    int256 maxFundingRate;         // e.g., 1e15 = 0.1%
+    int256  cumulativeFundingRate;  // accumulated funding rate (18 dec)
+    uint64  lastFundingTime;        // last update timestamp
+    uint64  fundingInterval;        // 1 hour = 3600 seconds (matches Lighter)
+    int256  maxFundingRate;         // e.g., 1e15 = 0.1%
+    uint256 sequencerMid;           // last mark price written by Settlement (18 dec)
+    uint64  sequencerMidTimestamp;  // when sequencer wrote it
 }
+
+uint64 public constant SEQUENCER_MID_STALENESS = 60;  // seconds
 
 mapping(uint256 => FundingState) public fundingStates;
 
+// Called by Settlement inside applyBatch — one entry per active market whose batch
+// touched the book. SETTLEMENT_ROLE only.
+function updateSequencerMid(uint256 marketId, uint256 mid) external onlyRole(SETTLEMENT_ROLE);
+// 1. sequencerMid[marketId] = mid
+// 2. sequencerMidTimestamp[marketId] = block.timestamp
+// 3. emit SequencerMidUpdated(marketId, mid)
+
+// Keeper poke — unchanged cadence (1h), changed mark-price source.
 function applyFunding(uint256 marketId) external;
-// 1. Check: block.timestamp >= lastFundingTime + fundingInterval
-// 2. markPrice = oracle.getMarkPrice(marketId)
-//    indexPrice = oracle.getIndexPrice(marketId)
-// 3. rate = clamp((markPrice - indexPrice) * 1e18 / indexPrice, -maxRate, +maxRate)
-// 4. cumulativeFundingRate += rate
-// 5. lastFundingTime = block.timestamp
-// 6. Emit FundingApplied(marketId, rate, cumulativeFundingRate)
+// 1. require(block.timestamp >= lastFundingTime + fundingInterval)
+// 2. Pick mark price with fallback:
+//    if block.timestamp - sequencerMidTimestamp <= SEQUENCER_MID_STALENESS:
+//        markPrice = sequencerMid
+//    else:
+//        markPrice = oracle.getMarkPrice(marketId)   // fallback: pure oracle
+//        emit FundingFellBackToOracle(marketId, block.timestamp - sequencerMidTimestamp)
+// 3. indexPrice = oracle.getIndexPrice(marketId)
+// 4. rate = clamp((markPrice - indexPrice) * 1e18 / indexPrice, -maxRate, +maxRate)
+// 5. cumulativeFundingRate += rate
+// 6. lastFundingTime = block.timestamp
+// 7. Emit FundingApplied(marketId, rate, cumulativeFundingRate, markPriceSource)
 
 function settleFunding(address account, uint256 marketId) internal;
 // Called by PositionManager on every position update AND by LiquidationEngine before liquidation
@@ -621,7 +658,7 @@ function withdraw(uint256 usdcAmount) external;
 // in one of the next N batches (ADR-0014 parameter) or the sequencer is in
 // default and matching is paused.
 function forceInclude(Intent calldata intent, bytes calldata signature) external;
-// Emits IntentForced(intentId, trader, block.timestamp + forceDeadline).
+// Emits ForceIncludeQueued(forcedIntentId, trader, intentHash, deadlineBatchNonce = batchNonce + N).
 
 // Cancel a force-included intent before it is consumed (e.g. user changed mind).
 function cancelForcedInclude(uint256 intentId) external;
@@ -1124,7 +1161,7 @@ Goal: on-chain contracts ready to receive proven batches.
 - [ ] Integrate a mock SP1 verifier for local testing (`MockSp1Verifier`) that accepts any proof
 - [ ] Update `Router.sol`: strip all order-placement entries; implement deposit/withdraw/forceInclude/cancelForcedInclude
 - [ ] MarketFactory: strip per-market OrderBook deployment; retain params registry + pause flags
-- [ ] Integration test: happy-path submitBatch with mock verifier drives Vault + PositionManager state correctly
+- [ ] Integration test: happy-path applyBatch with mock verifier drives Vault + PositionManager state correctly
 - [ ] Integration test: force-include deadline expiry pauses matching
 - [ ] Integration test: replay attempt (same nonce twice) reverts
 - [ ] Phase 5 wrap-up: blog post "Rewiring Gaekju for Proven Matching", tag v0.6.0
@@ -1153,7 +1190,7 @@ Goal: real SP1 proofs of matcher execution over batch blobs.
 - [ ] `crates/gaekju-prover`:
   - [ ] SP1 guest program wrapping `gaekju-matcher` — reads prevStateRoot, batch blob, Pyth attestations; writes postStateRoot
   - [ ] Host runner: dispatches proof generation (local dev via `sp1-sdk` cpu, remote via Succinct Prover Network)
-  - [ ] Public inputs commitment: `keccak256(prevRoot || batchHash || postRoot || batchNonce)`
+  - [ ] Public inputs commitment: `keccak256(abi.encode(BatchPublicInputs))` — `(prevStateRoot, postStateRoot, batchHash, batchNonce, chainId, forceIncludeCursor)` per §14.1
   - [ ] Vkey export for Settlement bootstrap
 - [ ] Wire real SP1 verifier in `Settlement.sol` (swap out MockSp1Verifier)
 - [ ] Gas benchmark: real EVM verification target ≤ 350k gas per batch
@@ -1164,7 +1201,7 @@ Goal: real SP1 proofs of matcher execution over batch blobs.
 
 Goal: external surface for users and ops.
 
-- [ ] Indexer: add `BatchFinalized`, `IntentForced`, `SequencerRotated` event decoding; split pending (from sequencer WS) vs finalized (from Settlement events) state; reorg-safe
+- [ ] Indexer: add `BatchSettled`, `ForceIncludeQueued`, `ForcedIntentResolved`, `SequencerRotated` event decoding; split pending (from sequencer WS) vs finalized (from Settlement events) state; reorg-safe
 - [ ] API: REST + WS as before, plus `GET /v1/batches/:nonce`, `GET /v1/proofs/:nonce`, `pending` vs `finalized` tags on all position/order views
 - [ ] Keeper: unchanged liquidation logic; add a watchdog that emits a metric when a force-included intent is approaching its deadline
 - [ ] SDK / CLI: user operations submit EIP-712 intents to the sequencer; only deposit/withdraw/forceInclude hit the chain directly
@@ -1407,15 +1444,17 @@ All markets are mirrored from Lighter.xyz. Leverage and margin configs follow Li
 
 The on-chain `bestBid < bestAsk` / `orderId → owner` / `TickBitmap` invariants of Path A are gone — there is no on-chain book to check. Settlement enforces a narrower set of invariants sufficient to make matching correctness equivalent to on-chain execution.
 
-- **Batch nonce strictly monotonic:** `submitBatch` requires `decodedNonce == stateBatchNonce + 1`. Enforced atomically with state-root update. No replay, no gaps, no reorder.
-- **Prev-state-root continuity:** Public inputs commit to `prevStateRoot`. Settlement rejects a proof whose `prevStateRoot` ≠ current `stateRoot`. Guarantees linear history.
-- **Proof validity + vkey binding:** `verifier.verifyProof(programVKey, publicInputsHash, sp1Proof)` must pass. `programVKey` is immutable at deploy time; changing the matcher requires governance-approved upgrade. Prevents "valid proof of wrong program."
-- **Public-inputs commitment:** `publicInputsHash == keccak256(prevRoot || batchHash || postRoot || batchNonce)`. Binds every decoded delta to the proof.
-- **Fills conservation:** for any batch, `Σ(balanceDelta.freeDelta) + Σ(lockedMarginDelta) + Σ(orderMarginDelta) + Σ(realizedPnlDelta) + insuranceFundDelta == 0`. Checked by Settlement after decoding. Any deviation rejects the batch.
-- **Force-inclusion bound:** for every `IntentForced(id, trader, deadline)` event older than the deadline, the next accepted batch must contain either an execution or a signed rejection for that intent. Else Settlement refuses the batch and calls `pauseMatching`.
+- **Batch nonce strictly monotonic:** `applyBatch` requires `bundle.publicInputs.batchNonce == batchNonce + 1`. Enforced atomically with state-root update. No replay, no gaps, no reorder.
+- **Prev-state-root continuity:** `BatchPublicInputs.prevStateRoot` must equal the stored `stateRoot`. Guarantees linear history.
+- **Proof validity + vkey binding:** `verifier.verifyProof(programVKey, abi.encode(BatchPublicInputs), sp1Proof)` must pass. `programVKey` is a storage slot rotated via pause-and-drain (§15.5); any change requires timelock + sequencer drain. Prevents "valid proof of wrong program."
+- **Chain-id binding:** `BatchPublicInputs.chainId == block.chainid`. Prevents proof replay on a sibling chain or testnet fork.
+- **Public-inputs commitment:** `BatchPublicInputs` = `(prevStateRoot, postStateRoot, batchHash, batchNonce, chainId, forceIncludeCursor)`. `batchHash == keccak256(abi.encode(BatchBlob))` binds every decoded delta to the proof.
+- **Fills conservation:** for any batch, `Σ(balanceDelta.freeDelta) + Σ(lockedMarginDelta) + Σ(orderMarginDelta) + Σ(realizedPnlDelta) + insuranceFundDelta + feeDelta == 0`. Checked by Settlement after decoding. Any deviation rejects the batch.
+- **Force-inclusion bound:** every `pendingForcedIntent` whose `deadlineBatchNonce <= bundle.publicInputs.batchNonce` must have a proved outcome in `BatchBlob.forcedOutcomes` (accepted-with-fill or rejected-with-reason code — see §15.2). Else `applyBatch` reverts with `ForcedIntentOverdue`, halting new batches until governance clears the queue. The sequencer cannot falsely mark "resolved" because outcomes are proved inside the zkVM.
+- **Force-include cursor monotonicity:** `bundle.publicInputs.forceIncludeCursor >= stored forceIncludeCursor`.
 - **Self-trade prevention:** enforced inside the proven matcher program; a sequencer that produced a self-trade would fail to prove.
 - **Per-account nonce monotonicity:** each intent carries a monotonic per-account nonce; the matcher rejects stale or duplicate nonces, and the proof commits to this.
-- **Pyth attestation binding:** any mark-price or index-price used by matcher (e.g., reduce-only checks against oracle) is committed by its Pyth attestation inside the batch's public inputs.
+- **Pyth attestation binding:** any mark-price or index-price used by matcher (e.g., reduce-only checks against oracle, or sequencer mid emission) is committed by its Pyth attestation inside the batch blob (`attestedPriceIds` + `attestedPriceHashes`).
 
 ### Testing Requirements
 - 100% branch coverage on all contracts
@@ -1432,7 +1471,7 @@ The on-chain `bestBid < bestAsk` / `orderId → owner` / `TickBitmap` invariants
 Gaekju connects to **Lighter.xyz** as its liquidity source. Lighter has 220+ perpetual markets including crypto, forex, and commodities — all with free unauthenticated API access. Real Lighter orderbook depth is mirrored onto Gaekju. Testnet users trade against this real-world depth through the sequencer, and their intents coexist with the mirrored intents in the same matching book.
 
 **Why Lighter as the mirror source:**
-- Gaekju follows Lighter's architecture — same on-chain CLOB model
+- Gaekju follows Lighter's architecture family — **off-chain Rust matcher + zk-proven batches + on-chain settlement**. Lighter uses custom STARK→SNARK circuits; Gaekju uses SP1 zkVM (ADR-0013). The live-market model (deterministic matching, bounded ordering-fairness trust, on-chain finality) is shared.
 - 220+ perp markets including RWA (EUR/USD, XAU/USD) — covers ALL Gaekju markets
 - Free, unauthenticated public API for orderbook + trade data
 - WebSocket with 50ms update frequency
@@ -2135,7 +2174,7 @@ A batch closes when any of:
 - `batch.intentCount >= MAX_INTENTS_PER_BATCH` (default 4096)
 - `batch.fillCount  >= MAX_FILLS_PER_BATCH` (default 8192)
 - `now() - batch.openedAt >= MAX_BATCH_AGE` (default 5s)
-- `forceInclude` intent is within `FORCE_DEADLINE - SAFETY_MARGIN` of its deadline
+- A queued force-included intent has `deadlineBatchNonce - nextBatchNonce <= SAFETY_BATCHES` (default 1) — force a close on the current batch to include it before it goes overdue
 
 On close: sequencer hands the batch blob + prevStateRoot + Pyth attestations to the prover. Sequencer continues accepting intents into the next batch in parallel.
 
@@ -2148,36 +2187,51 @@ The prover (`crates/gaekju-prover`) re-executes the matcher crate inside SP1 zkV
 ### 14.1 Circuit inputs
 
 **Private (witness):**
-- Full prev-state snapshot sufficient to recompute the state root (positions, balances, open-intent book).
+- Full prev-state snapshot sufficient to recompute the state root (positions, balances, open-intent book, force-include cursor).
 - Pyth price attestations referenced by the batch (verified against their signers inside the zkVM).
-- The batch blob (ordered intents + force-included intents).
+- The batch blob (ordered accepted intents + force-included intent outcomes).
 
-**Public (committed):**
-- `prevStateRoot`  — bytes32
-- `batchHash`      — keccak256 of the canonical batch encoding
-- `postStateRoot`  — bytes32
-- `batchNonce`     — uint256
+**Public (committed) — canonical `BatchPublicInputs`:**
+
+```solidity
+struct BatchPublicInputs {
+    bytes32 prevStateRoot;       // state root the batch applies to
+    bytes32 postStateRoot;       // state root after batch
+    bytes32 batchHash;           // keccak256(canonical BatchBlob encoding)
+    uint64  batchNonce;          // strictly monotonic
+    uint64  chainId;             // replay protection across chains/testnets
+    uint64  forceIncludeCursor;  // highest force-include queue id resolved in this batch
+}
+```
+
+Every field is load-bearing:
+- `prevStateRoot` / `postStateRoot` / `batchNonce` — chain continuity (§15.3).
+- `batchHash` — binds the off-chain batch blob to the proof.
+- `chainId` — prevents replay of a proof on a fork or sibling testnet.
+- `forceIncludeCursor` — strictly contiguous resolution cursor: the id of the **highest force-include queue entry** such that `[1..=forceIncludeCursor]` are all resolved. Gaps are forbidden. If queue entries 1-5 are resolved, `forceIncludeCursor == 5`. A batch that resolves entry 7 but leaves 6 pending is invalid — the prover cannot produce such a batch because the matching-core state machine advances the cursor only when the next contiguous id resolves. Settlement asserts `bundle.publicInputs.forceIncludeCursor >= stored.forceIncludeCursor` (monotonic — non-decreasing, can stay equal if no forced intents were due) and `<= latestQueuedId` (spec §15.3).
+
+`marketId` is **not** a public input — a single batch may contain fills across multiple markets; each `Fill` carries its own `marketId` inside the blob.
 
 ### 14.2 Public inputs commitment
 
-Settlement computes `expectedPublicHash = keccak256(abi.encode(prevStateRoot, batchHash, postStateRoot, batchNonce))` from its own state + caller-supplied batch. The SP1 verifier checks this commitment against the proof. Any mismatch rejects.
+Settlement computes `expectedPublicHash = keccak256(abi.encode(BatchPublicInputs{...}))` from its own state + caller-supplied batch header. The SP1 verifier checks this commitment against the proof's public outputs. Any mismatch rejects.
 
 ### 14.3 Output format
 
 The prover host outputs:
-```
+```solidity
 struct ProofBundle {
-    bytes32 postStateRoot;
-    bytes32 batchHash;
-    uint256 batchNonce;
-    bytes   sp1Proof;      // ~260 bytes Groth16 or ~1KB PLONK
-    bytes   batchBlob;     // decodable by Settlement
+    BatchPublicInputs publicInputs;
+    bytes sp1Proof;       // ~260 bytes Groth16 or ~1KB PLONK
+    bytes batchBlob;      // canonical BatchBlob (§15.2); keccak256 == publicInputs.batchHash
 }
 ```
 
+`Settlement.applyBatch(ProofBundle calldata bundle)` is the single entry point (§15.1). No separate `postStateRoot` / `publicInputsHash` parameters — everything is inside `publicInputs`.
+
 ### 14.4 EVM verifier gas target
 
-Target: **≤ 350k gas** per `submitBatch` end-to-end (proof verify + delta decode + contract calls). SP1 Groth16 verifier is ~230k gas; decode + apply is the remaining budget. Benchmarked in Phase 7.
+Target: **≤ 350k gas** per `applyBatch` end-to-end (proof verify + delta decode + contract calls). SP1 Groth16 verifier is ~230k gas; decode + apply is the remaining budget. Benchmarked in Phase 7.
 
 ### 14.5 Prover infrastructure
 
@@ -2195,94 +2249,216 @@ Deeper spec for the contract summarized in §3.4.
 
 ```solidity
 interface ISettlement {
-    function submitBatch(
-        bytes calldata batchBlob,
-        bytes32 postStateRoot,
-        bytes32 publicInputsHash,
-        bytes calldata sp1Proof
-    ) external;
+    function applyBatch(ProofBundle calldata bundle) external;
 
     function stateRoot() external view returns (bytes32);
-    function batchNonce() external view returns (uint256);
+    function batchNonce() external view returns (uint64);
     function programVKey() external view returns (bytes32);
+    function forceIncludeCursor() external view returns (uint64);
 
     // Force-include view
     function pendingForcedIntent(uint256 intentId) external view returns (
-        address trader, bytes32 intentDigest, uint256 deadline, bool resolved
+        address trader,
+        bytes32 intentDigest,
+        uint64 deadlineBatchNonce,
+        bool resolved,
+        uint8 outcome,          // 0 = unresolved, 1 = accepted, 2 = rejected
+        uint8 rejectReason      // ForcedRejectReason code (0 if accepted/unresolved)
     );
 
     // Governance
     function pauseMatching(string calldata reason) external;
     function unpauseMatching() external;
     function rotateSequencer(address next) external;
-    function setProgramVKey(bytes32 next) external;  // timelocked
+    function proposeProgramVKey(bytes32 next) external;    // timelocked
+    function activateProgramVKey(bytes32 next) external;   // requires paused + drained
 }
 ```
 
 ### 15.2 Batch blob encoding
 
-Canonical layout:
-```
-BatchBlob = abi.encode(
-    Header { uint256 nonce, bytes32 prevRoot, uint64 timestamp, uint32 intentCount, uint32 fillCount },
-    Intent[]  acceptedIntents,    // replayed for pending-state clients
-    Fill[]    fills,               // applied via PositionManager.applyBatchFills
-    BalanceDelta[] balanceDeltas,  // applied via Vault.applyBatchDelta
-    ForcedAck[] forcedAcks,        // ack of on-chain force-included intents
-    bytes32[] attestedPriceIds,    // pyth price ids referenced
-    bytes32[] attestedPriceHashes  // commitment to Pyth VAAs used
-)
+Canonical layout — `keccak256(BatchBlob) == publicInputs.batchHash`:
+
+```solidity
+struct BatchBlob {
+    BatchHeader       header;
+    Intent[]          acceptedIntents;     // replayed for pending-state clients
+    Fill[]            fills;                // applied via PositionManager.applyBatchFills
+    BalanceDelta[]    balanceDeltas;        // applied via Vault.applyBatchDelta
+    MidPriceUpdate[]  midPriceUpdates;      // applied by Settlement → FundingRate.updateSequencerMid
+    ForcedOutcome[]   forcedOutcomes;       // proved outcome for every queue entry resolved in this batch
+    bytes32[]         attestedPriceIds;     // pyth price ids referenced
+    bytes32[]         attestedPriceHashes;  // commitment to Pyth VAAs used
+}
+
+struct MidPriceUpdate {
+    uint256 marketId;
+    uint256 mid;       // 18-dec
+}
+
+struct BatchHeader {
+    uint64  batchNonce;
+    bytes32 prevStateRoot;
+    uint64  timestamp;
+    uint32  intentCount;
+    uint32  fillCount;
+    uint32  forcedCount;
+    uint64  forceIncludeCursor;  // must equal publicInputs.forceIncludeCursor
+}
+
+// Proved outcome for every force-included intent resolved in this batch.
+// The prover commits (forcedOutcomes) into state inside the zkVM; Settlement
+// does NOT accept free-form ForcedAck[]. The sequencer cannot claim "resolved"
+// without the prover running the intent (or its rejection) through the circuit.
+struct ForcedOutcome {
+    uint256 forcedIntentId;  // id from Router.forceInclude on-chain queue
+    uint8   outcome;         // 1 = accepted (matched or resting), 2 = rejected
+    uint8   rejectReason;    // ForcedRejectReason; 0 for accepted
+    bytes32 resultHash;      // accepted: fill/intent hash. rejected: hash(intent, reason)
+}
+
+// Dedupe rule: `acceptedIntents` and `forcedOutcomes` are disjoint execution lists.
+// An intent that arrived via Router.forceInclude is ALWAYS executed through the
+// forced path (its `forcedIntentId` drives ordering by on-chain queue position).
+// The matcher inside matching-core MUST:
+//   1. Before appending to `acceptedIntents`, check `forcedIntentSet.contains(hash(intent))`
+//      — if present, reject the sequencer-path submission with `DuplicateOfForced`.
+//   2. Execute `acceptedIntents` first (in seqId order), then `forcedOutcomes`
+//      (in `forcedIntentId` order).
+//   3. Per-account nonce advances once per intent regardless of path.
+// Rationale: forced-path execution is on-chain-observable (queue id, deadline),
+// so operators and users can audit it; reusing the normal path would let a
+// sequencer swallow a forced intent under the normal-path label and bypass the
+// force-include liveness check. Disjoint lists make the audit trivial.
+
+enum ForcedRejectReason {
+    NONE,                   // 0 — for accepted outcomes
+    EXPIRED,                // intent expiry past
+    BAD_NONCE,              // per-account nonce mismatch
+    INSUFFICIENT_MARGIN,    // IMR check failed
+    MARKET_PAUSED,
+    INVALID_SIGNATURE,
+    REDUCE_ONLY_VIOLATION,
+    UNKNOWN_MARKET
+}
 ```
 
 ### 15.3 State delta application
 
-Order of operations inside `submitBatch` (after SP1 verify):
-1. Decode `Header`; assert `header.nonce == batchNonce + 1`, `header.prevRoot == stateRoot`.
-2. Decode balance deltas; compute `Σ` and assert fills-conservation (§10).
-3. For every decoded `ForcedAck`, mark the corresponding `pendingForcedIntent.resolved = true`.
-4. Check: for every pending forced intent where `now > deadline`, it must be in `forcedAcks`. Else revert.
-5. `Vault.applyBatchDelta(header.nonce, balanceDeltas)` — atomic write.
-6. `PositionManager.applyBatchFills(header.nonce, fills)` — atomic write.
-7. Update `stateRoot = postStateRoot`, `batchNonce = header.nonce`.
-8. Emit `BatchFinalized`.
+Order of operations inside `applyBatch(bundle)` (UUPS, `whenNotPaused`):
+
+1. Decode `bundle.batchBlob` → `blob`. Assert `keccak256(bundle.batchBlob) == bundle.publicInputs.batchHash` and `bundle.publicInputs.chainId == block.chainid`.
+2. Assert `bundle.publicInputs.batchNonce == batchNonce + 1`.
+3. Assert `bundle.publicInputs.prevStateRoot == stateRoot`.
+4. Assert `blob.header.forceIncludeCursor == bundle.publicInputs.forceIncludeCursor`, `>= forceIncludeCursor` (monotonic, non-decreasing), `<= latestQueuedId`, and contiguous: all queue ids in `[1..=newCursor]` have `resolved == true` after step 7 below. Contiguity is the invariant — gaps are disallowed.
+5. SP1 verify: `verifier.verifyProof(programVKey, abi.encode(bundle.publicInputs), bundle.sp1Proof)`.
+6. **Force-include liveness check.** For every `pendingForcedIntent` with `deadlineBatchNonce <= bundle.publicInputs.batchNonce` and not yet resolved, there must be a matching entry in `blob.forcedOutcomes`. Else revert (`ForcedIntentOverdue`).
+7. **Force-include outcome application.** For every entry in `blob.forcedOutcomes`, copy `outcome` + `rejectReason` + `resultHash` into `pendingForcedIntent[id]` and set `resolved=true`. (The prover already proved these inside the circuit; Settlement only stores them for on-chain readers.)
+8. Decode `blob.balanceDeltas`; compute `Σ` and assert fills-conservation (§10, §15.3.1).
+9. **Market-pause check.** For every entry in `blob.fills` and every entry in `blob.midPriceUpdates`, assert `MarketFactory.marketActive(marketId) == true`; else revert `MarketPaused(marketId)`. Pause is governance-controlled and enforced at runtime by Settlement — **not** baked into the vkey — so a market can be paused without a vkey rotation.
+10. Apply Vault state — see §15.3.1 for the Vault/PositionManager split: `Vault.applyBatchDelta(bundle.publicInputs.batchNonce, blob.balanceDeltas)`.
+11. Apply mid-price updates — loop `blob.midPriceUpdates` and call `FundingRate.updateSequencerMid(marketId, mid)` directly from Settlement (not via Vault). This keeps `SETTLEMENT_ROLE` as the only role mutating FundingRate state.
+12. `PositionManager.applyBatchFills(bundle.publicInputs.batchNonce, blob.fills)`.
+13. Update `stateRoot = bundle.publicInputs.postStateRoot`, `batchNonce = bundle.publicInputs.batchNonce`, `forceIncludeCursor = bundle.publicInputs.forceIncludeCursor`.
+14. Emit `BatchSettled(batchNonce, prevStateRoot, postStateRoot, batchHash, forceIncludeCursor)`.
+
+**Canonical event (single source of truth):**
+
+```solidity
+event BatchSettled(
+    uint64  indexed batchNonce,
+    bytes32         prevStateRoot,
+    bytes32         postStateRoot,
+    bytes32         batchHash,
+    uint64          forceIncludeCursor
+);
+event ForcedIntentResolved(
+    uint256 indexed forcedIntentId,
+    uint8           outcome,
+    uint8           rejectReason,
+    bytes32         resultHash
+);
+```
+
+No other event names (`BatchApplied`, `BatchFinalized`) are emitted — references in older drafts are obsolete.
+
+### 15.3.1 Vault vs PositionManager responsibility split
+
+**One owner per state field.** The ambiguity in earlier drafts (both `BalanceDelta[]` and `PositionManager` mutating the same `Vault` buckets on a fill) is resolved as follows:
+
+| Vault bucket                                | Owner (sole writer in Settlement flow) |
+|----------------------------------------------|---------------------------------------|
+| Free collateral (deposit / withdraw / PnL)   | **Vault** via `applyBatchDelta`       |
+| Order margin (locked on place, unlocked on fill/cancel) | **Vault** via `applyBatchDelta` |
+| Position margin (locked on open, unlocked on close) | **Vault** via `applyBatchDelta`   |
+| Realized PnL credit/debit on fill             | **Vault** via `applyBatchDelta`       |
+| Funding payment on settle                     | **Vault** via `applyBatchDelta`       |
+| `Position.size / entryPrice / collateral`     | **PositionManager** via `applyBatchFills` |
+| `Position.lastCumulativeFunding`              | **PositionManager** via `applyBatchFills` |
+| `_positionHolders` set membership             | **PositionManager** via `applyBatchFills` |
+
+`PositionManager.applyBatchFills` is **position-only** under Path B. It does **not** call `vault.unlockOrderMargin`, `vault.unlockMargin`, `vault.lockMargin`, or `vault.realizePnl` inline. All vault-side effects of every fill (order-margin release, position-margin lock, realized PnL, flip margin delta, funding payment) are pre-computed inside the zkVM and emitted as entries in `blob.balanceDeltas`. Settlement applies `balanceDeltas` first, then `fills` — the order matters because PositionManager reads `vault.freeCollateral` only for invariant assertions, never to mutate.
+
+**Equivalence test (`contracts-v2` Task 4):** for every scenario in the Phase 2 `PositionManager.t.sol` (open, increase, partial close, full close, flip with funding settle), construct a batch of one fill + the equivalent `BalanceDelta[]` computed off-chain, run `applyBatch`, and assert final `(Position, Vault.freeCollateral, Vault.lockedOrderMargin, Vault.lockedPositionMargin)` equals the sequential-path result. This is a gate for merging contracts-v2.
 
 ### 15.4 Caller guards on downstream contracts
 
 Every downstream contract (`Vault`, `PositionManager`) gates its batch entry point with `onlyRole(SETTLEMENT_ROLE)`. The role is assigned at deploy time to the Settlement proxy address and changed only via Timelock governance. `ORDERBOOK_ROLE` is removed.
 
-LiquidationEngine retains its own role (`LIQUIDATOR_ROLE` held by keeper EOAs). MarginEngine, FundingRate, OracleAdapter expose only view + keeper paths to external callers.
+LiquidationEngine retains its own role (`LIQUIDATOR_ROLE` held by keeper EOAs) and runs **fully on-chain** against finalized state — it is not routed through the sequencer in v1 (see §3.7, §2.5). MarginEngine, FundingRate, OracleAdapter expose only view + keeper paths to external callers.
 
-### 15.5 Programs and upgrades
+### 15.5 Program vkey rotation — storage-backed + drain flow
 
-`programVKey` is immutable once set at deployment. Upgrading the matcher program (bug fix, new feature) requires:
-1. Timelocked `setProgramVKey(newVKey)` proposal.
-2. During the timelock, sequencer may continue accepting intents proved against the old vkey.
-3. At timelock expiry, an atomic upgrade batch switches vkey; intents proved against old vkey are rejected thereafter.
-4. Any pending force-included intents are carried across; their deadlines do not reset.
+`programVKey` is a storage slot on Settlement, rotated via a **pause-and-drain** procedure. The prior draft that mixed "immutable" with "atomic timelock flip" is retracted — it can strand in-flight batches (old-key proof mid-flight, nonce/root continuity breaks when the next batch uses the new key).
+
+Rotation procedure (on-chain runbook):
+
+1. **Propose** `proposeProgramVKey(newVKey)` — records pending vkey + starts `VKEY_TIMELOCK` (24h per ADR-0009).
+2. **Pause sequencer** (off-chain). Sequencer stops accepting new intents; UI surfaces "matching paused for upgrade".
+3. **Drain in-flight batches.** Sequencer finishes any batch already opened, hands it to the prover, prover finishes any already-enqueued proof, submitter lands all drained proofs on Settlement. The chain is now at a clean finalization boundary (`stateRoot` == last proved `postStateRoot`, prover queue empty).
+4. **Force-include drain.** If `forceIncludeQueue` has unresolved entries with non-past deadlines, operator must wait for the prover run above to resolve them OR extend deadlines via a separate timelock proposal before vkey flip. No rotation proceeds with overdue unresolved forced intents.
+5. **Activate** `activateProgramVKey(newVKey)` — requires `block.timestamp >= proposalTimestamp + VKEY_TIMELOCK`, requires `paused() == true`, requires `proverQueueDrained()` oracle = true (a trusted off-chain-signed attestation from a guardian set OR simply a manual governance-signed assertion in v1). Writes `programVKey = newVKey`, emits `ProgramVKeyRotated(oldVKey, newVKey)`.
+6. **Redeploy prover** with the new matcher program binary whose vkey matches `newVKey`. Verify `cargo run -p gaekju-prover -- verify-vkey` matches the on-chain value.
+7. **Unpause** sequencer. Fresh batches start at `batchNonce = previousNonce + 1` with `prevStateRoot` still equal to the last finalized root — nonce/root continuity is preserved because no batches were lost in between.
+
+Rejected alternatives:
+- **Immutable vkey + redeploy Settlement.** Requires migrating `stateRoot`, `batchNonce`, `forceIncludeQueue`, `pendingForcedIntent[]`, and all `SETTLEMENT_ROLE` grants. Too much state to migrate safely for a matcher bug fix.
+- **Dual-vkey grace window.** Verifier must try two keys or Settlement must pick by batch header; adds circuit/proof branching complexity for a feature used ≤ annually.
+
+**Anti-grief: non-cooperative sequencer during rotation.** A malicious sequencer could refuse to close its last open batch, blocking the drain step (3) and preventing `activateProgramVKey`. Governance circuit-breaker:
+
+- `ROTATION_TIMELOCK` (default 24h) is the standard path.
+- `ROTATION_FORCE_TIMELOCK` (default 7 days) is a second, longer timelock attached to the same `proposeProgramVKey` proposal. If it expires **and** `paused() == true` for the entire window, governance may call `forceActivateProgramVKey(newVKey, forceState)` which: (a) accepts governance-signed `(postStateRoot, batchNonce, forceIncludeCursor)` as the new canonical state (skipping any in-flight undrained batch), (b) marks all currently-queued force-included intents `resolved = true, outcome = REJECTED_SEQUENCER_FORCED_ROTATION`, refunds their fees, (c) writes `programVKey = newVKey`, (d) emits `ProgramVKeyForceRotated(oldVKey, newVKey, forceState)`.
+- Assumption: 7-day + pause requirement is severe enough that this path is only ever used to recover from a captured or dead sequencer, not routine upgrades. Tradeoff: governance effectively asserts the state root unilaterally, which is a trust concentration — this is the escape hatch for "sequencer hostile, bug in matcher requires vkey change, force-include queue would otherwise accumulate forever" and is documented as such.
+
+**Force-include deadline unit.** Deadlines are stored on-chain as `deadlineBatchNonce = batchNonce_at_queue_time + FORCE_INCLUDE_N` (a batch-nonce count, not wall-clock seconds). Across a pause-and-drain rotation, `batchNonce` does not advance while the sequencer is paused, so queued intents do not spontaneously expire during the 24h timelock. If the rotation takes long enough that protocol operators judge the queue stale, governance may call `extendForceIncludeDeadlines(delta)` (admin helper) to add `delta` to every queued entry's `deadlineBatchNonce` before unpausing. This replaces the earlier "wall-clock" framing — it was a documentation bug; the implementation is batch-nonce based, consistent with §15.2 / §15.3.
 
 ---
 
 ## 16. Soft-Confirm UX
 
-Users experience three confidence levels:
+Users experience three confidence levels. **Only `finalized` is durable.** Both `soft-ack` and `batch-sealed` are sequencer-local states that can be rewound under prover or verifier failure (§17.2, §17.3).
 
-| State | Latency | Backed by | Reversible? |
-|-------|---------|-----------|-------------|
-| **Soft-ack** | <50ms (sequencer response) | Sequencer signature + WAL | Yes — only if sequencer drops offline before batch submit and never recovers (very unlikely); force-include hatches intents through |
-| **Batch closed** | ~5s (matches Giwa block cadence) | Sequencer committed batch to prover | No for matching logic (committed); yes for on-chain state (not yet applied) |
-| **Finalized** | ~30s–2min (proof gen + Giwa inclusion) | SP1 proof + Settlement tx | No (fully on-chain) |
+| State | Latency | Backed by | Durable? |
+|-------|---------|-----------|----------|
+| **Soft-ack** | <50ms (sequencer response) | Sequencer signature + WAL | **No** — rewound if sequencer crashes before batch close OR if the enclosing batch later fails to prove. User-facing guarantee: "acknowledged, not final." |
+| **Batch-sealed** | ~5s (matches Giwa block cadence) | Sequencer committed batch to prover | **No** — rewound if the proof cannot be produced (§17.2) or if the proof is invalid (§17.3). Sealed does NOT mean on-chain. |
+| **Finalized** | ~30s–2min (proof gen + Giwa inclusion) | `BatchSettled` event on Settlement | **Yes** — fully on-chain, not reversible except by L2 reorg. |
 
 **UX patterns (Phase 8):**
-- Trade history panel shows soft-acked fills with a pending indicator; it flips to finalized on `BatchFinalized` with matching seqId.
-- Balance panel shows "available + pending" broken out. Withdrawals use available only.
-- On sequencer disconnect: client warns "matching paused"; user can still read on-chain state and use force-include.
+- Trade history panel shows soft-acked and sealed fills with a clear **pending** badge. Badge flips to **final** on the `BatchSettled` event that carries their `batchNonce`.
+- Balance panel shows `available` (finalized free collateral) and `pending` (soft-acked/sealed deltas) separately. Withdrawals draw from `available` only. This is a hard rule, not a default.
+- On sequencer disconnect: client warns "matching paused"; user can still read on-chain finalized state and submit `Router.forceInclude`. Any soft-acked intent not yet sealed MAY be lost.
+- On batch rewind (§17.3): client surfaces a **rollback** banner and replays/reconciles the user's local trade log against the new tip.
 - Wallet popups for deposit / withdraw / force-include still look like normal tx flows; all other actions are off-chain signature prompts.
 
-**SLAs (Phase 10 targets):**
+**SLAs (Phase 10 targets) — operational, not protocol invariants:**
 - Soft-ack p95 < 50ms regional, < 200ms global.
 - Batch close p95 < 6s.
 - Batch finalization p95 < 2 min (dominated by Succinct Prover Network latency).
-- Force-include deadline: 30 min (configurable via ADR-0014).
+
+**Protocol-enforced bounds (distinct from SLAs above):**
+- Force-include bound: **N = 3 batches** (≈ 15s at 5s cadence, ADR-0014). This is the maximum latency from a force-included intent landing in the on-chain queue to Settlement either processing it or entering recovery mode. It is enforced in `applyBatch` (§15.3 step 6) — the exchange halts if the bound is violated. Any longer "30-minute"-style number seen in earlier drafts was an operational SLA target, not a protocol invariant, and is retracted.
 
 ---
 
@@ -2293,7 +2469,7 @@ Users experience three confidence levels:
 Symptom: sequencer stops accepting or stops batching.
 
 - Traders cannot submit new intents through normal path.
-- Traders can use `Router.forceInclude(intent)` for up to `FORCE_DEADLINE` worth of in-flight trades.
+- Traders can use `Router.forceInclude(intent)` to queue in-flight trades; Settlement must produce a proved outcome for each within `FORCE_INCLUDE_N` batches (≈ 15s at the 5s ADR-0015 cadence).
 - If halt persists past deadline, Settlement rejects the next attempted batch (forced-inclusion invariant fires) → `pauseMatching("force_timeout")` emits.
 - Governance rotates sequencer via `rotateSequencer(next)`; force-include queue carries across.
 - Existing positions continue to accrue funding and remain liquidatable on-chain (liquidation path does not require sequencer).
@@ -2311,7 +2487,7 @@ Symptom: sequencer emits batches but no proofs are produced.
 
 ### 17.3 Proof invalid (verifier revert)
 
-Symptom: `submitBatch` reverts with `Sp1VerifyFailed`.
+Symptom: `applyBatch` reverts with `Sp1VerifyFailed`.
 
 - The offending batch never finalizes on-chain.
 - Sequencer is in an inconsistent state (its soft book diverged from what the prover proved).
@@ -2320,9 +2496,9 @@ Symptom: `submitBatch` reverts with `Sp1VerifyFailed`.
 
 ### 17.4 Batch reversion on L1
 
-Symptom: `submitBatch` tx reverts for reasons other than verifier (e.g., nonce mismatch after a Giwa reorg).
+Symptom: `applyBatch` tx reverts for reasons other than verifier (e.g., nonce mismatch after a Giwa reorg).
 
-- Sequencer detects revert in `BatchFinalized` event absence past expected block.
+- Sequencer detects revert in `BatchSettled` event absence past expected block.
 - Re-reads `stateRoot` and `batchNonce` from Settlement.
 - If current on-chain nonce is behind sequencer's assumption: resubmit the batch with refreshed `prevStateRoot`.
 - If current on-chain nonce is ahead (another submitter somehow landed a batch): pause, investigate — this should only happen if multiple sequencers are mistakenly authorized.
