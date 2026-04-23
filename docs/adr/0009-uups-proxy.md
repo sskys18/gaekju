@@ -16,6 +16,8 @@ Upgradeability introduces trust assumptions: whoever controls the upgrade mechan
 ## Decision
 All Gaekju contracts use the UUPS proxy pattern (EIP-1822) with OpenZeppelin's `UUPSUpgradeable` base contract. Upgrades are controlled by a 24-hour Timelock contract owned by a 3-of-5 multisig (Gnosis Safe). The `_authorizeUpgrade()` function in each implementation contract restricts upgrade calls to the Timelock address. An emergency pause mechanism (separate from upgrades) allows any multisig signer to pause trading without waiting for the timelock, but pause cannot modify contract logic or drain funds. All contracts use the initializer pattern (`initialize()` instead of `constructor()`) and include storage gaps (`uint256[50] private __gap`) in every contract to reserve storage slots for future variables.
 
+Settlement's SP1 `programVKey` rotation follows the same governance envelope but is **not** an implementation upgrade. The normal path is a 24-hour timelocked `proposeProgramVKey` → pause-and-drain → `activateProgramVKey` flow. In the non-cooperative-sequencer case documented in design spec §15.5, governance may use `forceActivateProgramVKey` only after a separate `ROTATION_FORCE_TIMELOCK` (default 7 days) with Settlement continuously paused; that path force-asserts `(postStateRoot, batchNonce, forceIncludeCursor)` and rejects queued force-included intents with a dedicated reject code. This is an explicit circuit-breaker, not the default upgrade path.
+
 ## Consequences
 ### Positive
 - Stable contract addresses: traders, keepers, and the frontend interact with proxy addresses that never change, even across dozens of upgrades during testnet
@@ -25,11 +27,13 @@ All Gaekju contracts use the UUPS proxy pattern (EIP-1822) with OpenZeppelin's `
 - 3-of-5 multisig eliminates single-key risk: no individual can upgrade contracts or drain funds alone
 - Storage gaps allow adding new state variables to existing contracts without colliding with derived contract storage
 - The pattern is well-supported by OpenZeppelin's hardhat-upgrades and foundry-upgrades plugins, which validate storage layout compatibility before deployment
+- The governance model cleanly distinguishes ordinary upgrades / vkey rotations (24h timelock) from sequencer-hostile recovery (`ROTATION_FORCE_TIMELOCK`, default 7 days, pause-only window)
 
 ### Negative
 - If the `_authorizeUpgrade()` function is accidentally removed or broken in a new implementation, the contract becomes permanently non-upgradeable (this is the primary UUPS footgun, mitigated by OpenZeppelin's upgrade safety checks)
 - Initializer pattern is error-prone: forgetting to call a parent initializer or calling `initialize()` on the implementation contract directly (not the proxy) are common bugs
 - 24-hour timelock slows down iteration during active testnet development; critical bug fixes must wait 24 hours unless the emergency pause is sufficient as a stopgap
+- The forced vkey-rotation path is a concentrated governance power: after 7 paused days it can assert a settlement state and flush queued force-includes. This is intentionally narrow but it is still trust-heavy.
 - Proxy indirection makes debugging harder: transaction traces show delegatecall into the implementation, and storage reads must account for the proxy's storage layout
 - Each contract deployment is two transactions (deploy implementation + deploy proxy) instead of one, increasing deployment script complexity
 
@@ -37,12 +41,12 @@ All Gaekju contracts use the UUPS proxy pattern (EIP-1822) with OpenZeppelin's `
 ### Transparent Proxy (EIP-1967)
 - Pros: Simpler mental model (proxy handles admin calls, delegates everything else), no risk of losing upgrade capability through implementation bugs, widely deployed and battle-tested (most OpenZeppelin proxy deployments historically used this pattern)
 - Cons: Higher gas cost per call (~2,100 gas for the `msg.sender == admin` check on every external call, which compounds across thousands of daily transactions on an active orderbook), admin address cannot interact with the contract as a normal user (the proxy intercepts admin calls), separate ProxyAdmin contract adds deployment complexity
-- Why rejected: UUPS provides the same upgradeability with less runtime overhead and a cleaner implementation-owned authorization model. Historically this ADR cited per-call gas savings for frequent on-chain matching as a key factor; after ADR-0012 matching is off-chain and that rationale no longer applies, but the upgradeability and implementation-owned authorization arguments remain decisive on their own.
+- Why rejected: UUPS provides the same upgradeability with less runtime overhead and a cleaner implementation-owned authorization model. Historically this ADR cited per-call gas savings for frequent on-chain matching as a key factor; after ADR-0012 matching is off-chain and that rationale no longer applies, but the upgradeability, storage-backed Settlement continuity, and implementation-owned authorization arguments remain decisive on their own.
 
 ### Diamond Pattern (EIP-2535)
 - Pros: Supports unlimited contract size by splitting logic across multiple facets, fine-grained upgradeability (upgrade one function without touching others), single proxy address for the entire protocol
 - Cons: Dramatically more complex than UUPS (facet routing, diamond storage, loupe functions), debugging is harder (which facet handled this call?), tooling support is weaker (fewer auditing tools understand Diamond storage layout), the complexity is unjustified when individual contracts are well within the 24KB size limit, fewer auditors are experienced with Diamond patterns
-- Why rejected: Gaekju's modular architecture (separate contracts for OrderBook, MarginEngine, LiquidationEngine, etc.) already provides the separation that Diamond addresses. Each contract is independently upgradeable via its own UUPS proxy. Diamond would consolidate everything behind a single proxy, which is architecturally opposed to the modular design chosen in ADR-0002. The complexity cost is high with no corresponding benefit.
+- Why rejected: Gaekju's modular architecture (separate contracts for Settlement, MarginEngine, LiquidationEngine, etc.) already provides the separation that Diamond addresses. Each contract is independently upgradeable via its own UUPS proxy. Diamond would consolidate everything behind a single proxy, which is architecturally opposed to the modular design chosen in ADR-0002. The complexity cost is high with no corresponding benefit.
 
 ### No Proxy (Immutable Contracts)
 - Pros: Simplest deployment, no proxy overhead, no upgrade trust assumptions, strongest trust guarantees for users (code is law, literally)

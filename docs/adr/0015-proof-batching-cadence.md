@@ -28,16 +28,16 @@ We adopt the following cadence parameters for v1. All are protocol parameters go
 
 The three cadence layers are surfaced to users as three distinct pending states in the frontend and SDK:
 
-| Layer | Latency | UX label | Finality meaning |
-|-------|---------|----------|------------------|
-| Sequencer ack | < 100ms | "filled" | Matcher has committed the fill. Reversible only if the sequencer goes into default. |
-| Batch closed | 5s | "sealed" | Intent is inside a batch whose input list is frozen. Sequencer cannot silently drop or reorder this intent relative to its batch mates. |
-| On-chain settled | 40-70s | "final" | Proof verified on Giwa, state delta applied. User's Vault / PositionManager storage reflects the fill. Cannot be reverted short of governance recovery. |
+| Layer | Latency | UX label | Durability |
+|-------|---------|----------|------------|
+| Sequencer ack | < 100ms | "filled" | **Non-durable.** Sequencer-local. Rewound if the sequencer crashes before batch close OR if the enclosing batch later fails to prove. UX should surface this as "acknowledged," not "final." |
+| Batch closed | 5s | "sealed" | **Non-durable.** Sequencer-local. Rewound if the proof cannot be produced or the proof is invalid (design spec §17.2, §17.3). The batch's input list is frozen, but "sealed" is NOT on-chain. |
+| On-chain settled | 40-70s | "final" | **Durable.** `BatchSettled` event on Giwa, state delta applied. User's Vault / PositionManager storage reflects the fill. Only reversible by L2 reorg. |
 
-Clients should optimistically render "filled" state for UX smoothness and visibly advance to "sealed" and "final" as confirmations arrive. Withdrawals require "final" — Vault.withdraw only acts on state that has been settled on-chain.
+Clients should optimistically render "filled" for UX smoothness and visibly advance to "sealed" and "final" as confirmations arrive. Both "filled" and "sealed" carry a visible pending badge. Withdrawals require "final" — `Vault.withdraw` only acts on state that has been settled on-chain. On batch rewind the client surfaces a rollback banner and reconciles the local trade log against the new tip.
 
 ### Batch nonce monotonicity
-Settlement.sol tracks `lastBatchNonce`. Every accepted proof must reference `priorBatchNonce = lastBatchNonce` and output `newBatchNonce = lastBatchNonce + 1`. This:
+Settlement.sol tracks `batchNonce`. Every accepted proof must reference `bundle.publicInputs.prevStateRoot == stateRoot` and `bundle.publicInputs.batchNonce == batchNonce + 1`. This:
 - prevents the sequencer from submitting parallel forks of the batch chain,
 - prevents replay of an old proof,
 - gives the indexer (ADR-0007) a simple linear view of history.

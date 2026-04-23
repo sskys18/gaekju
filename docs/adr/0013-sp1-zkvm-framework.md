@@ -20,7 +20,9 @@ Jolt (a16z crypto) uses a lookup-argument-heavy design that is faster in theory 
 ## Decision
 We adopt **SP1** as the zkVM for `crates/gaekju-prover`. The matching program is a single Rust binary compiled for SP1's RISC-V target; the same source is compiled natively for the sequencer's hot path. Proving is submitted to Succinct's managed prover network by default, with a local-prover fallback for development and for the censorship-escape case where the managed network is unavailable.
 
-On-chain verification uses SP1's canonical Groth16 EVM verifier contract deployed behind a UUPS proxy so the verifier can be upgraded if Succinct ships a new version (PLONK wrapping, verifier gas reductions, etc.). Settlement.sol calls the verifier, checks the program's verification key against a pinned value, and then decodes the public outputs (prior state root, new state root, batch metadata, force-include cursor).
+On-chain verification uses SP1's canonical Groth16 EVM verifier contract deployed behind a UUPS proxy so the verifier can be upgraded if Succinct ships a new version (PLONK wrapping, verifier gas reductions, etc.). Settlement.sol calls the verifier, checks the program's verification key against a pinned storage slot, and decodes the canonical `BatchPublicInputs` struct — `(prevStateRoot, postStateRoot, batchHash, batchNonce, chainId, forceIncludeCursor)` — defined in the design spec §14.1. The `forceIncludeCursor` + `chainId` fields are load-bearing: the cursor binds the prover's resolved force-include outcomes to the on-chain queue (preventing the sequencer from claiming "resolved" without circuit proof), and `chainId` prevents a valid proof from being replayed on a sibling chain or testnet fork.
+
+`programVKey` is a mutable storage slot on Settlement rotated via a pause-and-drain procedure (design spec §15.5). Immutable-vkey + Settlement-redeploy and dual-vkey grace windows were considered and rejected — see spec §15.5 for the trade-off.
 
 ## Consequences
 ### Positive
