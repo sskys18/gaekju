@@ -54,7 +54,7 @@ User ─EIP-712 intent─▶ gaekju-sequencer (Rust matching, BTreeMap book)
                         └─ applies Fill[] → PositionManager
                               │
                               ▼
-                   Indexer catches BatchApplied event
+                   Indexer catches BatchSettled event
                    → API serves finalized state to clients
 ```
 

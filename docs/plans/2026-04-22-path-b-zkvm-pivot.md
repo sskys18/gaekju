@@ -36,7 +36,7 @@ User → Rust sequencer (off-chain OrderBook, matches orders deterministically)
 | `LiquidationEngine.sol` | Calls PositionManager | Same, unchanged |
 | `FundingRate.sol` (Phase 3) | Called by PM | Same, unchanged |
 | `OracleAdapter.sol` | OK | OK — used by both sequencer and settlement |
-| `MarketFactory.sol` (Phase 3) | Deploys OrderBook | Deploys Settlement (per market) |
+| `MarketFactory.sol` (Phase 3) | Deploys OrderBook | Config-only registry; Settlement is deployed once globally |
 | `Router.sol` (Phase 3) | Wraps OrderBook calls | Wraps sequencer API (off-chain) + deposit/withdraw on-chain |
 | `crates/gaekju-sequencer/` | N/A | **NEW** — Rust matching engine |
 | `crates/gaekju-prover/` | N/A | **NEW** — SP1 prover service |
@@ -136,7 +136,7 @@ Goal: Rewrite `2026-04-06-phase3-funding-factory-router.md` for new contract sur
 | 3.5 | Plan item: Adapt `PositionManager.sol` — add `applyBatchFills(Fill[] calldata)` entry callable only by Settlement. Remove OrderBook caller path | — |
 | 3.6 | Plan item: Adapt `Vault.sol` — add `applyBatchDelta` callable only by Settlement | — |
 | 3.7 | Plan item: `FundingRate.sol` — unchanged from Phase 3 design except caller guard moves from PM to Settlement | — |
-| 3.8 | Plan item: `MarketFactory.sol` — deploys Settlement per market instead of OrderBook | — |
+| 3.8 | Plan item: `MarketFactory.sol` — becomes config-only; no per-market Settlement deploys | — |
 | 3.9 | Plan item: `Router.sol` — thin contract, only deposit/withdraw + `forceInclude(intent)` escape hatch |
 | 3.10 | Plan item: Mark previously-planned Phase 3 tasks obsolete: Task 5 (IOC/FOK in OrderBook) |
 | 3.11 | Mark old Phase 3 plan: add `## Status: Superseded by 2026-04-22-contracts-v2.md` |

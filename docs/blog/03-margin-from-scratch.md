@@ -2,6 +2,8 @@
 
 > Part 03 of "Building a Perp DEX from Scratch"
 
+> **2026-04-23 Note:** The margin math in this post still applies under Path B, but the Settlement plumbing changed. Under the current spec, `Settlement.applyBatch` sends vault-side effects through `BalanceDelta[]` and position-side effects through `PositionManager.applyBatchFills`; `PositionManager` no longer performs inline `vault.*` mutations on the batch path.
+
 ---
 
 ## Why Margin Matters
@@ -67,14 +69,13 @@ This is implemented using 18-decimal fixed-point math (`mulFp` / `divFp`) to avo
 
 ## Order Margin to Position Margin Conversion
 
-This is where the plumbing gets interesting. When an order fills:
+This is where the plumbing gets interesting. In the original Phase 2 sequential path, `PositionManager` converted order margin to position margin inline by calling Vault helpers directly. Under the current Path B Settlement flow, that ownership is split cleanly:
 
-1. Settlement (applying a proven batch from the sequencer) calls `PositionManager.updatePosition(account, marketId, sizeDelta, fillPrice, marginDelta)`
-2. PositionManager calls `vault.unlockOrderMargin(account, marginDelta)` — releases order reservation
-3. PositionManager calls `vault.lockMargin(account, marginDelta)` — locks as position collateral
-4. Position struct is updated with new size, entry price, and collateral
+1. The matcher/prover computes the vault-side effects for the fill off-chain and emits them as `BalanceDelta[]`
+2. `Settlement.applyBatch` calls `Vault.applyBatchDelta(...)` first — releasing order margin, locking position margin, and realizing PnL
+3. `Settlement.applyBatch` then calls `PositionManager.applyBatchFills(...)` to update size, entry price, collateral, and funding index
 
-The key insight: order margin and position margin are different accounting buckets in the Vault. The conversion happens atomically inside a single transaction.
+The key insight is unchanged: order margin and position margin are different accounting buckets in the Vault. What changed is **who** performs the conversion on the proven batch path.
 
 ## PnL on Close
 
@@ -103,7 +104,7 @@ This avoids any gap where the account has no position but has unrealized capital
 - All math is 18-decimal fixed-point. USDC (6 decimals) is scaled at the Vault boundary.
 - `FixedPointMath.mulFpSigned` handles signed multiplication correctly — the sign of PnL depends on position direction.
 - The `EnumerableSet` tracks position holders per market for ADL ranking (next post).
-- Funding settlement is stubbed as a no-op — Phase 3 fills that in.
+- Funding settlement existed as a stub in the original Phase 2 code. Under the current Path B design, the live settlement path carries funding deltas inside `BalanceDelta[]` and updates `lastCumulativeFunding` through `PositionManager.applyBatchFills`.
 
 ---
 
