@@ -12,6 +12,7 @@
 Retarget the existing Rust support crates for the zkVM-proven architecture. The sequencer is the live source of truth; Settlement.sol is the finality source. Each crate grows a second data source (or swaps the first) and surfaces new concepts — batches, proofs, force-include.
 
 ABI bindings for `Settlement` / updated `Vault` / updated `PositionManager` land in `gaekju-types` as part of the contracts-v2 plan. These crates consume those bindings.
+`gaekju-types` must export the canonical Path B structs and event decoders these crates read directly: `BatchPublicInputs`, `ProofBundle`, `BatchBlob`, `BatchHeader`, `Intent` (EIP-712 signed-intent envelope), `Fill`, `BalanceDelta`, `MidPriceUpdate`, `ForcedOutcome`, `BatchSettled`, `ForceIncludeQueued`, and `ForcedIntentResolved`.
 
 ---
 
@@ -22,14 +23,14 @@ ABI bindings for `Settlement` / updated `Vault` / updated `PositionManager` land
 **Sources:**
 
 1. **Sequencer WS** (`ws://.../ws/stream`) — subscribes to `book:*`, `trades:*`, `mark:*`. Produces "pre-settlement" rows for live PnL + charts.
-2. **Giwa logs** — watches `Settlement.BatchApplied`, `Settlement.ForceIncluded`, plus the existing `Vault.Deposit/Withdraw`, `PositionManager.PositionUpdated`, `LiquidationEngine.Liquidated`, `FundingRate.FundingSettled`.
+2. **Giwa logs** — watches `Settlement.BatchSettled`, `Settlement.ForceIncludeQueued`, `Settlement.ForcedIntentResolved`, plus the existing `Vault.Deposit/Withdraw`, `PositionManager.PositionUpdated`, `LiquidationEngine.Liquidated`, `FundingRate.FundingSettled`.
 
 **Steps:**
 
 1. Add `sources/sequencer_ws.rs` module; reconnect + resume-from-last-seq logic.
 2. Delete `sources/orderbook_events.rs` (legacy Phase 1 indexer wiring against `OrderBook` events). Replace with `sources/settlement_events.rs`.
-3. Schema migration: new `batches` table (`{ market_id, batch_nonce, prev_root, post_root, tx_hash, applied_at }`), new `fills_pending` vs `fills_final` distinction, new `force_includes` table.
-4. Reconciliation job: for every sequencer-reported fill, assert it eventually matches a `BatchApplied` fill (by `(intent_hash, fill_index)`); alert on orphans.
+3. Schema migration: new `batches` table (`{ batch_nonce, prev_root, post_root, tx_hash, applied_at, force_include_cursor }`) with **no `market_id` column** because a single global batch can contain fills across many markets. Market attribution lives on child rows (`fills_*`, `mid_price_updates`, `forced_outcomes`), not on the batch header.
+4. Reconciliation job: for every sequencer-reported fill, assert it eventually matches a `BatchSettled` fill (by `(intent_hash, fill_index)`); alert on orphans.
 
 **Verification:** `cargo test -p gaekju-indexer`; an integration test runs sequencer + Anvil + indexer, feeds 20 intents, asserts the indexer DB converges to the on-chain state.
 
@@ -41,7 +42,7 @@ Expose:
 
 - `GET /markets` — metadata (pulls from MarketFactory registry).
 - `GET /book/:market` — proxies sequencer REST (live).
-- `GET /trades/:market?finalized=true|false` — indexer query; `finalized=true` only includes fills from `BatchApplied`, `false` includes pending sequencer fills.
+- `GET /trades/:market?finalized=true|false` — indexer query; `finalized=true` only includes fills from `BatchSettled`, `false` includes pending sequencer fills.
 - `GET /trader/:addr` — merged: sequencer view (open orders, pending fills) + on-chain view (Vault balance, positions, realised funding).
 - `GET /batch/:nonce` — mirrors sequencer's batch-status endpoint plus `txHash` + `blockNumber` once on-chain.
 - `GET /batch?status=pending` — list of batches in prover or awaiting on-chain finality. Useful for UX pending banners.
@@ -58,25 +59,25 @@ Steps:
 
 ---
 
-### Task 3 — `gaekju-keeper`: retargeted liquidations + unchanged funding
+### Task 3 — `gaekju-keeper`: on-chain liquidations + unchanged funding
 
-Keeper runs two loops today: funding-poke and liquidation-bot.
+Keeper runs two loops: funding-poke and liquidation-bot. **Liquidation stays fully on-chain under Path B v1** — it is not routed through the sequencer, preserving the outage-safety property claimed in spec §2.5, §10, and §17.1 (existing positions remain liquidatable even if the sequencer is down). Sequencer-routed liquidation was considered and rejected for v1; see spec §3.7 and rejected-alternatives note in ADR-0012. Revisit in a later phase if batch-cadence / MEV pressure justifies adding a `kind = Liquidate` intent path.
 
-**Funding-poke** — unchanged. Calls `FundingRate.poke()` on each market at the 1h boundary. The contract is unchanged by the pivot (ADR-0011 still holds).
+**Funding-poke** — unchanged. Calls `FundingRate.applyFunding(marketId)` on each market at the 1h boundary. Mark-price source is the sequencer mid-price written on-chain per batch with 60s staleness fallback to pure oracle (spec §3.8).
 
 **Liquidation-bot:**
 
-- Primary path: submit liquidation intent to the sequencer (same EIP-712 schema as trader intents, with `kind = Liquidate`). Sequencer matches it like any other taker.
-- Fallback path: if the sequencer is down (detected via health check / WS disconnect > `sequencer_down_threshold`), submit `Router.forceInclude(liquidationIntent)` directly on-chain. Settlement must then process it within `N` batches or enter `defaultMode`, at which point the keeper can drive liquidations through a separate emergency endpoint that Settlement exposes (design detail in `2026-04-22-contracts-v2.md`, force-include queue).
+- **Single on-chain path.** Keeper reads finalized state from Settlement + indexer, runs `LiquidationEngine.isLiquidatable(account, marketId)`, and calls `LiquidationEngine.liquidate(account, marketId)` directly on Giwa. No sequencer involvement; no force-include fallback needed. The sequencer observes on-chain liquidation events and reconciles its in-memory position view for the affected account before accepting new intents.
 
 Steps:
 
-1. Refactor `liquidation::target_address` from `OrderBook` to `Sequencer` REST / `Router` ABI.
-2. Add health-monitor task (pings sequencer `/healthz`).
-3. Add metrics `liquidations_submitted_total{path="sequencer"|"force_include"}`.
-4. Update tests + fixtures; no logic change to the liquidation math itself.
+1. Refactor `liquidation::target_address` off the deleted `OrderBook` path; target `LiquidationEngine` directly via alloy-generated ABI from `gaekju-types`.
+2. Read mark price from `OracleAdapter` (unchanged) for local liquidation-candidate scanning.
+3. After each on-chain `PositionLiquidated` event, poke the sequencer via `POST /v1/reconcile/:account/:market` so its book drops any resting orders of the liquidated account. Sequencer treats this as an advisory; on next batch it must anyway verify state against on-chain.
+4. Add metrics `liquidations_submitted_total` (single path, no labels).
+5. Update tests + fixtures; no logic change to the liquidation math.
 
-**Verification:** `cargo test -p gaekju-keeper`; integration test simulates sequencer outage and asserts fallback path.
+**Verification:** `cargo test -p gaekju-keeper`; integration test drives a position underwater via price feed, asserts keeper liquidates on-chain even with the sequencer intentionally stopped.
 
 ---
 
@@ -154,6 +155,23 @@ These crate updates land **after** the contracts-v2 plan ships the new ABI bindi
 4. This plan's Tasks 1-6 run in parallel (6 independent crates).
 5. Final cross-cutting verification.
 
+### Breaking-change migration note (external consumers)
+
+Path B ships a breaking change to the on-chain event surface. Publish this in the `v0.6.0` release notes / SDK CHANGELOG / dashboards runbook the moment contracts-v2 merges:
+
+| Retired (Path A)                    | Replacement (Path B)                                   | Notes |
+|-------------------------------------|--------------------------------------------------------|-------|
+| `OrderBook.OrderPlaced`             | (none — no on-chain orderbook)                         | Orders are EIP-712 intents submitted to the sequencer REST/WS. Use `GET /v1/trader/:addr` for open orders. |
+| `OrderBook.OrderCanceled`           | (none)                                                 | Same. |
+| `OrderBook.Traded`                  | `Settlement.BatchSettled` (aggregate) + indexer `fills_final` rows | Per-fill data lives in the batch blob, not individual events. |
+| `Settlement.BatchApplied` (draft)   | `Settlement.BatchSettled`                              | Schema: `(uint64 batchNonce, bytes32 prevStateRoot, bytes32 postStateRoot, bytes32 batchHash, uint64 forceIncludeCursor)`. |
+| `Settlement.BatchFinalized` (draft) | `Settlement.BatchSettled`                              | Same event. Older drafts mis-named it; do not filter on the old name. |
+| `Settlement.IntentForced` (draft)   | `Settlement.ForceIncludeQueued`                        | Schema: `(uint256 forcedIntentId, address trader, bytes32 intentHash, uint64 deadlineBatchNonce)`. |
+| `Settlement.IntentForcedResolved` (draft) | `Settlement.ForcedIntentResolved`                | Schema: `(uint256 forcedIntentId, uint8 outcome, uint8 rejectReason, bytes32 resultHash)`. |
+| `applyBatch(header, fills, publicValues, proof)` (4-arg) | `applyBatch(ProofBundle)` (1-arg)          | `ProofBundle = (BatchPublicInputs, bytes sp1Proof, bytes batchBlob)`. |
+
+External dashboards (Dune, Grafana pulling from RPC, Tenderly alerts) MUST update their event filters to `BatchSettled` / `ForceIncludeQueued` / `ForcedIntentResolved` at the release cutover. There is no dual-emit compatibility period — the old event names are never emitted by the shipped Settlement.
+
 ---
 
 ## Definition of done
@@ -162,4 +180,4 @@ These crate updates land **after** the contracts-v2 plan ships the new ABI bindi
 - No lingering references to `OrderBook`, `BitmapLib`, `PackedOrder`, or `TickMath` anywhere in `crates/`.
 - Indexer converges within 5s of on-chain finality in the local E2E test.
 - CLI and SDK ship updated READMEs describing the new intent flow.
-- Keeper successfully liquidates via both primary and fallback paths in tests.
+- Keeper successfully liquidates on-chain in tests (including sequencer-down scenario).

@@ -15,7 +15,7 @@ By the end of this plan:
 
 - `OrderBook.sol`, `IOrderBook.sol`, `BitmapLib.sol`, `PackedOrder.sol`, `TickMath.sol` and their tests are deleted.
 - `Settlement.sol` + `ISettlement.sol` exist, wire an `ISP1Verifier`, and are the only caller permitted on Vault / PositionManager / MarginEngine / FundingRate (`SETTLEMENT_ROLE`).
-- `MarketFactory` deploys a per-market Settlement instead of an OrderBook.
+- `MarketFactory` is a config-only registry — **no per-market contract deploys**. Settlement, Vault, PositionManager, MarginEngine, LiquidationEngine, FundingRate, OracleAdapter are deployed once globally. `createMarket(params)` writes a `marketId` entry into shared storage.
 - `Router.sol` is a thin shim: `deposit`, `withdraw`, `forceInclude(Intent)`.
 - All surviving Phase 1/2 tests compile and pass; new Settlement unit + integration tests cover the proof verification and state-delta application paths.
 
@@ -101,78 +101,102 @@ cd contracts && forge test --no-match-contract "OrderBook\|Bitmap\|TickMath\|Pac
 - `contracts/src/Settlement.sol`
 - `contracts/test/unit/Settlement.t.sol`
 
-**Interface sketch:**
+**Canonical types — match design spec §14.1, §15.1, §15.2 exactly.** If these diverge, the spec wins. Do not invent alternate layouts.
 
 ```solidity
-struct BatchHeader {
-    uint64 marketId;
-    uint64 batchNonce;
+struct BatchPublicInputs {
     bytes32 prevStateRoot;
     bytes32 postStateRoot;
-    bytes32 intentsRoot;
-    bytes32 fillsRoot;
-    uint64 timestamp;
+    bytes32 batchHash;            // keccak256(abi.encode(BatchBlob))
+    uint64  batchNonce;
+    uint64  chainId;
+    uint64  forceIncludeCursor;
 }
 
-struct Fill {
-    bytes32 takerIntentHash;
-    bytes32 makerIntentHash;
-    address taker;
-    address maker;
-    int256 baseDelta;   // signed qty, 1e18
-    uint256 price;      // 1e18
-    uint256 fee;        // 1e6 USDC
+struct ProofBundle {
+    BatchPublicInputs publicInputs;
+    bytes             sp1Proof;
+    bytes             batchBlob;   // canonical encoding — see spec §15.2
 }
 
 interface ISettlement {
-    function applyBatch(
-        BatchHeader calldata header,
-        Fill[] calldata fills,
-        bytes calldata publicValues,
-        bytes calldata proof
-    ) external;
-
-    function forceInclude(bytes calldata intent, bytes calldata sig) external;
-    function stateRoot() external view returns (bytes32);
-    function batchNonce() external view returns (uint64);
+    function applyBatch(ProofBundle calldata bundle) external;
+    function forceInclude(bytes calldata intent, bytes calldata sig) external payable;
+    function stateRoot()            external view returns (bytes32);
+    function batchNonce()           external view returns (uint64);
+    function forceIncludeCursor()   external view returns (uint64);
+    function programVKey()          external view returns (bytes32);
 }
+
+event BatchSettled(
+    uint64  indexed batchNonce,
+    bytes32         prevStateRoot,
+    bytes32         postStateRoot,
+    bytes32         batchHash,
+    uint64          forceIncludeCursor
+);
+event ForcedIntentResolved(
+    uint256 indexed forcedIntentId,
+    uint8           outcome,      // 1 = accepted, 2 = rejected
+    uint8           rejectReason,
+    bytes32         resultHash
+);
 ```
+
+No `BatchHeader { marketId, intentsRoot, fillsRoot, ... }` — that earlier sketch is retracted. `marketId` is per-`Fill`, not per-batch (one batch can contain fills across markets). `intentsRoot` / `fillsRoot` are not public inputs; the batch blob is identified by `batchHash` and decoded on-chain.
 
 **Steps:**
 
-1. Scaffold `Settlement.sol` UUPS upgradable (`Initializable`, `AccessControlUpgradeable`, `UUPSUpgradeable`).
-2. Wire `ISP1Verifier public verifier;` + `bytes32 public programVKey;` — set via initializer.
-3. Implement `applyBatch`:
-   - `require(header.batchNonce == batchNonce + 1, "bad nonce");`
-   - `require(header.prevStateRoot == stateRoot, "bad prev root");`
-   - `verifier.verifyProof(programVKey, publicValues, proof);`
-   - decode `publicValues` and assert it commits to `(header, intentsRoot, fillsRoot)`.
-   - loop `fills`: call `PositionManager.applyBatchFills(Fill[])` and `Vault.applyBatchDelta(Delta[])` in one external tx. Both new entry points added in Task 4.
-   - persist `stateRoot = header.postStateRoot; batchNonce = header.batchNonce;`.
-   - emit `BatchApplied(header)`.
-4. Implement `forceInclude` — stash the raw intent in a bounded queue (`bytes32[] forceIncludeQueue`), emit `ForceIncluded(hash, deadlineBatch)`. Settlement enforces that force-included intents appear in a batch within `N` batches (config) or Settlement enters `defaultMode` halting new non-force batches.
-5. Unit tests: nonce monotonicity, bad prev root, bad proof revert, happy path with a mock verifier that always returns true, force-include queue bounds.
+1. Scaffold `Settlement.sol` UUPS upgradable (`Initializable`, `AccessControlUpgradeable`, `UUPSUpgradeable`, `PausableUpgradeable`).
+2. Wire `ISP1Verifier public verifier;` + `bytes32 public programVKey;` + `bytes32 public pendingProgramVKey;` + `uint64 public programVKeyTimelockStart;` — set via initializer.
+3. Implement `applyBatch(ProofBundle calldata bundle)` — order of ops exactly as spec §15.3 steps 1-14:
+   - decode `bundle.batchBlob` → `blob`; assert `keccak256(bundle.batchBlob) == bundle.publicInputs.batchHash`;
+   - `require(bundle.publicInputs.chainId == block.chainid)`;
+   - `require(bundle.publicInputs.batchNonce == batchNonce + 1)`;
+   - `require(bundle.publicInputs.prevStateRoot == stateRoot)`;
+   - `require(blob.header.forceIncludeCursor == bundle.publicInputs.forceIncludeCursor)`;
+   - `verifier.verifyProof(programVKey, abi.encode(bundle.publicInputs), bundle.sp1Proof)`;
+   - force-include liveness: every `pendingForcedIntent[i]` with `deadlineBatchNonce <= bundle.publicInputs.batchNonce` and `!resolved` MUST appear in `blob.forcedOutcomes` — else revert `ForcedIntentOverdue(i)`;
+   - for each `blob.forcedOutcomes[k]`: store `outcome` + `rejectReason` + `resultHash` + set `resolved = true`, emit `ForcedIntentResolved(...)`;
+   - `Vault.applyBatchDelta(batchNonce, blob.balanceDeltas)` — Vault is the sole writer of free/order/position-margin and realized-PnL buckets (spec §15.3.1);
+   - For each `MidPriceUpdate` in `blob.midPriceUpdates`, Settlement calls `FundingRate.updateSequencerMid(marketId, mid)` **directly** — not via Vault. `SETTLEMENT_ROLE` on FundingRate is granted once at bootstrap;
+   - `PositionManager.applyBatchFills(batchNonce, blob.fills)` — position-state only, no inline `vault.*` mutations (spec §15.3.1);
+   - assert `forceIncludeCursor` is contiguous (every queue id `[1..=newCursor]` now `resolved == true`) and `>= storedCursor` (monotonic, spec §15.3);
+   - persist `stateRoot = postStateRoot; batchNonce = newNonce; forceIncludeCursor = newCursor`;
+   - emit `BatchSettled(...)`. (Not `BatchApplied`, not `BatchFinalized` — those names are retired.)
+4. Implement `forceInclude(bytes calldata intent, bytes calldata sig) external payable` — decode `marketId + trader + nonce + deadline` from the EIP-712 payload, append to `pendingForcedIntent[]` with `deadlineBatchNonce = batchNonce + FORCE_INCLUDE_N` (default 3 per ADR-0014). Charge fixed USDC fee for spam protection. Emit `ForceIncludeQueued(id, trader, intentHash, deadlineBatchNonce)`.
+5. Implement `proposeProgramVKey(newVKey)` + `activateProgramVKey(newVKey)` per spec §15.5 (storage-backed, pause-and-drain). `activate` requires `paused() == true`, `block.timestamp >= proposalTimestamp + ROTATION_TIMELOCK`, and no overdue unresolved force-included intents. Plus `forceActivateProgramVKey(newVKey, forceState)` per spec §15.5 anti-grief path (non-cooperative sequencer recovery) — requires `paused() == true` for the full `ROTATION_FORCE_TIMELOCK` window (default 7 days) and writes governance-asserted `(postStateRoot, batchNonce, forceIncludeCursor)` while rejecting all queued force-included intents with `rejectReason = REJECTED_SEQUENCER_FORCED_ROTATION`.
+6. Unit tests: nonce monotonicity, bad prev root, bad chainId, bad proof revert, happy path with mock verifier, force-include queue bounds, force-include overdue revert, force-include outcome storage, vkey rotation happy path, vkey rotation while sequencer unpaused (must revert).
 
 **Verification:** `forge test --match-contract Settlement` green.
 
 ---
 
-### Task 4 — Vault + PositionManager batch entry points
+### Task 4 — Vault + PositionManager batch entry points (single-owner split)
 
 **Files edited:**
 
-- `contracts/src/Vault.sol` — `applyBatchDelta(Delta[])`
+- `contracts/src/Vault.sol` — `applyBatchDelta(BalanceDelta[])`
 - `contracts/src/PositionManager.sol` — `applyBatchFills(Fill[])`
 - `contracts/src/interfaces/IVault.sol`, `IPositionManager.sol`
 
+**Single-owner rule (spec §15.3.1):** under Path B, every Vault-bucket mutation for a fill (order-margin release, position-margin lock/unlock, realized PnL, funding payment, flip margin delta) is pre-computed off-chain by the matcher and applied by `Vault.applyBatchDelta` **only**. `PositionManager.applyBatchFills` writes position state only and **MUST NOT** call any mutating `vault.*` method. This reverses the Phase 2 per-fill pattern where PositionManager called `vault.unlockOrderMargin`, `vault.lockMargin`, `vault.realizePnl` inline. Those calls are deleted from the batch path.
+
 **Steps:**
 
-1. `Vault.applyBatchDelta` iterates signed collateral deltas, calls `_credit` / `_debit`, guarded by `SETTLEMENT_ROLE`.
-2. `PositionManager.applyBatchFills` mirrors the old per-fill path (`openOrIncrease` / `reduceOrClose` / `flip`) but batched, with a single MarginEngine check after each trader's cumulative delta is applied to reduce redundant oracle reads.
-3. Reuse Phase 2 invariants: signed qty conservation, no cross-market writes, IMR check at position open/increase, MMR check for decrease into-loss positions.
-4. Extend Phase 2 unit tests to assert batched input produces identical state to sequential per-fill calls.
+1. `Vault.applyBatchDelta(uint64 batchNonce, BalanceDelta[] calldata deltas)`:
+   - `onlyRole(SETTLEMENT_ROLE)`.
+   - Iterate `deltas`; dispatch on balance/margin/PnL/funding kinds only (e.g. `UnlockOrderMargin`, `LockPositionMargin`, `UnlockPositionMargin`, `RealizePnl`, `FundingPayment`). Each type maps to an existing Phase 1 internal helper (`_unlockOrderMargin`, `_realizePnl`, etc.).
+   - `MidPriceUpdate` is **not** a `BalanceDelta` kind under the final spec. Settlement applies `blob.midPriceUpdates` separately via `FundingRate.updateSequencerMid` before `PositionManager.applyBatchFills`.
+   - Assert fills-conservation `Σ balanceDeltas + insurance + fees == 0` (spec §10).
+2. `PositionManager.applyBatchFills(uint64 batchNonce, Fill[] calldata fills)`:
+   - `onlyRole(SETTLEMENT_ROLE)`.
+   - Walk `fills` in order; for each, update `(size, entryPrice, collateral, lastCumulativeFunding)` and the `_positionHolders` set.
+   - **No `vault.*` calls.** Read `vault.freeCollateral(account)` only for invariant assertions (IMR at open/increase, MMR at decrease-into-loss). A failed assertion reverts the whole `applyBatch` — the sequencer must not have accepted the fill in the first place if invariants would break, so a revert means prover/matcher divergence and is an incident.
+3. **Equivalence test** (spec §15.3.1 gate): `contracts/test/unit/BatchEquivalence.t.sol`. For each scenario in `PositionManager.t.sol` (open / increase / partial close / full close / flip / flip-into-loss / funding-settled-on-fill), construct (a) a one-fill `Fill[]` + equivalent `BalanceDelta[]` computed in a pure-Solidity helper, and (b) the Phase 2 sequential per-fill call path (legacy test harness). Assert end-state `(Position, vault.freeCollateral, vault.lockedOrderMargin, vault.lockedPositionMargin, FundingRate.cumulative)` is **bit-identical**. Any divergence blocks the contracts-v2 merge.
+4. Reuse Phase 2 invariants: signed qty conservation, no cross-market writes, IMR at open/increase, MMR at decrease-into-loss, `USDC.balanceOf(vault) * 1e12 >= totalDeposits`.
 
-**Verification:** `forge test --match-path contracts/test/unit/PositionManager.t.sol` + `Vault.t.sol` green; new `Settlement_Integration.t.sol` simulates a 10-fill batch and asserts Vault/PM state.
+**Verification:** `forge test --match-path contracts/test/unit/PositionManager.t.sol` + `Vault.t.sol` + `BatchEquivalence.t.sol` green; new `SettlementBatch_Integration.t.sol` (Task 9) simulates a 10-fill batch and asserts end state.
 
 ---
 
@@ -191,7 +215,7 @@ interface ISettlement {
 
 ---
 
-### Task 6 — MarketFactory (deploys Settlement per market)
+### Task 6 — MarketFactory (config-only registry, global Settlement)
 
 **Files edited:**
 
@@ -199,14 +223,28 @@ interface ISettlement {
 - `contracts/test/unit/MarketFactory.t.sol`
 - `contracts/script/DeployMarket.s.sol`
 
+**Global-singleton model.** Settlement / Vault / PositionManager / MarginEngine / LiquidationEngine / FundingRate / OracleAdapter are all deployed once by a bootstrap script (`script/DeployCore.s.sol`, separate from per-market creation). `MarketFactory.createMarket` is pure configuration registration — no contract deploys — so adding a market is a single storage write + event.
+
 **Steps:**
 
-1. Remove the `_deployOrderBook` internal; replace with `_deploySettlement(params)` that deploys the `Settlement` UUPS proxy with market-specific config (verifier address, programVKey, initial IMR/MMR per ADR-0006, fee schedule, force-include window `N`).
-2. `createMarket(MarketParams)` wires: Vault (shared), MarginEngine (shared), OracleAdapter (shared), FundingRate (per market), PositionManager (per market), Settlement (per market).
-3. Grant `SETTLEMENT_ROLE` on Vault + PM + MarginEngine + FundingRate to the new Settlement.
-4. Emit `MarketCreated(marketId, settlement, fundingRate, positionManager)`.
+1. Delete the `_deployOrderBook` internal. Do **not** replace with `_deploySettlement` — Settlement is global, already deployed.
+2. `createMarket(MarketParams params) external onlyRole(ADMIN_ROLE) returns (uint256 marketId)`:
+   - assign `marketId = nextMarketId++`;
+   - write `marketParams[marketId] = params` (tick, lot, IMR, MMR, Pyth price id, funding interval, max funding rate, min/max order size, maker/taker fees);
+   - `marketActive[marketId] = true`;
+   - write initial `FundingRate.fundingStates[marketId]` via `FundingRate.initMarket(marketId, params)` (new admin helper);
+   - write initial `MarginEngine` market config;
+   - emit `MarketCreated(marketId, params)`.
+3. `SETTLEMENT_ROLE` is granted at bootstrap, once, to the global Settlement. It is **not** re-granted per market.
+4. `pauseMarket(marketId)` / `unpauseMarket(marketId)` admin functions flip `marketActive[marketId]`; Settlement reads this during `applyBatch` and reverts any batch containing a fill for a paused market.
+5. Define `script/DeployCore.s.sol` explicitly instead of hand-waving it:
+   - deploy verifier, Vault, PositionManager, MarginEngine, FundingRate, LiquidationEngine, OracleAdapter, Settlement, Router, and MarketFactory once;
+   - initialize every proxy in dependency order;
+   - grant `SETTLEMENT_ROLE` to the global Settlement on Vault / PositionManager / MarginEngine / FundingRate;
+   - grant keeper / admin roles (`LIQUIDATOR_ROLE`, market-admin) and wire Router / MarketFactory to the already-deployed core addresses;
+   - assert `hasRole(SETTLEMENT_ROLE, settlement) == true` everywhere before any market registration.
 
-**Verification:** `forge test --match-contract MarketFactory` green, deploy script on Anvil creates a market and the Settlement address is stored in the registry.
+**Verification:** `forge test --match-contract MarketFactory` green; `DeployCore.s.sol` on Anvil deploys the core set once, then `DeployMarket.s.sol` registers BTC-USD and ETH-USD as market ids 1 and 2 without redeploying any contracts.
 
 ---
 
@@ -226,7 +264,7 @@ function forceInclude(bytes calldata intent, bytes calldata sig) external;
 
 1. Delete every call that wrapped OrderBook (place/cancel/IOC/FOK/market/reduce-only).
 2. `deposit` / `withdraw` are pass-throughs to Vault.
-3. `forceInclude` proxies to the correct market's Settlement based on the decoded intent (read `marketId` from the EIP-712 payload). Charges a fixed fee in USDC to prevent spam.
+3. `forceInclude` forwards the raw signed intent to the **global** Settlement contract. Settlement pushes it into a single unified force-include queue (one queue for the whole exchange, not one per market) and assigns `deadlineBatchNonce = batchNonce + FORCE_INCLUDE_N`. Validates `marketActive[intent.marketId] == true`. Charges a fixed fee in USDC to prevent spam.
 4. Update `Router.t.sol` to cover the three entry points only.
 
 **Verification:** `forge test --match-contract Router` green.
@@ -288,6 +326,7 @@ Steps:
 ## Migration notes for downstream crates
 
 - `gaekju-types` regenerates bindings after Task 5. Downstream crates (sequencer, prover, indexer, keeper, mirror, SDK, CLI) pick up via Cargo workspace.
+- `gaekju-types` must export the final Path B surface, not just raw ABIs: `BatchPublicInputs`, `ProofBundle`, `BatchBlob`, `BatchHeader`, `Intent` (EIP-712 signed-intent envelope shared by sequencer intake + `Router.forceInclude` + prover guest), `Fill`, `BalanceDelta`, `MidPriceUpdate`, `ForcedOutcome`, and event decoders for `BatchSettled`, `ForceIncludeQueued`, and `ForcedIntentResolved`.
 - `gaekju-indexer` must stop watching OrderBook events after Task 1 or it will crash. Coordinate so indexer update (see `2026-04-22-indexer-api-updates.md`) lands in the same release train.
 
 ---

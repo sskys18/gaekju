@@ -24,7 +24,7 @@ Matching logic lives in a shared `gaekju-matching-core` crate so the same code r
 - **serde + bincode** — canonical batch serialization for the prover.
 - **tracing** + `tracing-subscriber` — structured logs.
 - **metrics + metrics-exporter-prometheus** — operational visibility.
-- **tokio** runtime, single-threaded per-market matching actor to keep determinism.
+- **tokio** runtime, with a single-threaded global intake/batch coordinator assigning `seqId` and `batchNonce`, plus deterministic per-market book handlers behind it.
 
 No floats. All prices/quantities are `i128` in 1e18 units, same convention as the Solidity side.
 
@@ -96,13 +96,14 @@ crates/
 ### Task 4 — Sequencer crate bootstrap + per-market actor
 
 - `gaekju-sequencer/main.rs` reads config (markets, RPC URLs, Settlement address, proofer address, batch cadence).
-- Spawn one `matching_actor` task per market. The actor owns the mutable state for that market; all mutations flow through an `mpsc::UnboundedSender<Command>` channel.
+- Keep one global coordinator that owns exchange-wide sequencing state (`seqId`, force-include queue mirror, global `batchNonce`) and routes intents into per-market books. Per-market matching tasks are fine for isolation, but they do **not** own the batch chain or assign independent batch nonces.
 - `Command = { SubmitIntent(Intent, Sig, oneshot::Sender<Result<Ack, Reject>>), CloseBatch(oneshot::Sender<Batch>), Snapshot(...) }`.
 - Soft-ack latency target < 10ms p50 on the actor loop.
 
 ### Task 5 — REST endpoints (axum)
 
 - `POST /v1/intent` — body `{ intent, sig }`; returns `{ status: "accepted"|"rejected", fills: [...] }`.
+  - Validation must reject a sequencer-path submission whose `hash(intent)` is already present in the mirrored on-chain force-include queue. Return `DuplicateOfForced`; the intent must execute through the forced path only (spec §15.2 disjoint-list rule).
 - `GET /v1/book/:market` — depth snapshot (top N levels).
 - `GET /v1/trades/:market?since=...` — recent fills.
 - `GET /v1/trader/:addr` — balance, position, open orders, nonce.
@@ -121,10 +122,10 @@ crates/
 
 ### Task 7 — Batcher + prover bridge
 
-- `batcher` task runs every `batch_ms` (default 2000) or when `max_intents_per_batch` hits.
-- On close: snapshot `(prev_state_root, accepted_intents, fills, post_state_root, batch_nonce)` into `Batch` struct, write bincode to `prover/inbox/<nonce>.batch`, notify the prover via an `mpsc` channel or a filesystem watch.
-- `batch_nonce` strictly monotonic per market.
-- Intent ordering inside a batch is receive-order (FIFO) — recorded in the batch header so the prover can re-run and compare.
+- `batcher` task runs every `batch_ms` (**default 5000** — matches ADR-0015 protocol cadence; must stay consistent with the force-include N=3-batches ≈ 15s bound) or when `max_intents_per_batch` hits.
+- On close: snapshot the canonical global `BatchBlob` inputs — `header`, `accepted_intents`, `fills`, `balance_deltas`, `mid_price_updates`, force-include queue entries selected for resolution in this batch, and attested Pyth data — into the `Batch` struct, write bincode to `prover/inbox/<nonce>.batch`, notify the prover via an `mpsc` channel or a filesystem watch.
+- `batch_nonce` is a single exchange-wide counter, not per market.
+- Intent ordering inside a batch is receive-order under the global `seqId` assigned by the coordinator. Forced intents are executed through the separate forced path in `forcedIntentId` order; if a queued forced intent is not yet due and is not voluntarily resolved in this batch, it is omitted from `forcedOutcomes` and the contiguous cursor does not advance past it.
 
 ### Task 8 — Persistence + crash recovery
 
