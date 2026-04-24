@@ -21,6 +21,9 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
     error InsufficientOrderMargin();
     error InsufficientInsuranceFund();
     error ZeroAmount();
+    error StaleBatchNonce();
+    error FillsConservationViolated();
+    error NegativeBalance();
 
     IERC20 public usdc;
 
@@ -29,8 +32,9 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
     mapping(address => uint256) public orderMargin;
     uint256 public insuranceFund;
     uint256 public totalDeposits;
+    uint64  public lastAppliedBatchNonce;
 
-    uint256[50] private __gap;
+    uint256[49] private __gap;
 
     function initialize(address _usdc, address _admin) external initializer {
         usdc = IERC20(_usdc);
@@ -127,6 +131,64 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
         totalDeposits -= fromLocked;
         deficit = loss - fromLocked; // uncovered loss — caller must draw from insurance fund
         emit PnlRealized(account, pnl);
+    }
+
+    /// @notice Apply a batch of per-account balance deltas proved by the matcher.
+    /// @dev spec §15.3 step 10. Sole writer for free/order/position-margin and
+    ///      realized-PnL under Path B. Fills-conservation (§10) enforced: the
+    ///      sum of all account deltas plus insuranceFundDelta equals zero.
+    function applyBatchDelta(uint64 batchNonce_, BalanceDelta[] calldata deltas)
+        external
+        onlyRole(SETTLEMENT_ROLE)
+    {
+        if (batchNonce_ <= lastAppliedBatchNonce) revert StaleBatchNonce();
+
+        int256 conservationSum;
+
+        for (uint256 i; i < deltas.length; ++i) {
+            BalanceDelta calldata d = deltas[i];
+
+            conservationSum +=
+                d.freeDelta + d.lockedMarginDelta + d.orderMarginDelta + d.insuranceFundDelta;
+
+            if (d.insuranceFundDelta != 0) {
+                if (d.insuranceFundDelta > 0) {
+                    insuranceFund += uint256(d.insuranceFundDelta);
+                } else {
+                    uint256 dec = uint256(-d.insuranceFundDelta);
+                    if (insuranceFund < dec) revert InsufficientInsuranceFund();
+                    insuranceFund -= dec;
+                }
+            }
+
+            if (d.account == address(0)) continue;
+
+            _applyBucketDelta(balances, d.account, d.freeDelta);
+            _applyBucketDelta(lockedMargin, d.account, d.lockedMarginDelta);
+            _applyBucketDelta(orderMargin, d.account, d.orderMarginDelta);
+
+            if (d.realizedPnlDelta != 0) emit PnlRealized(d.account, d.realizedPnlDelta);
+        }
+
+        if (conservationSum != 0) revert FillsConservationViolated();
+
+        lastAppliedBatchNonce = batchNonce_;
+        emit BatchDeltaApplied(batchNonce_, deltas.length);
+    }
+
+    function _applyBucketDelta(mapping(address => uint256) storage bucket, address account, int256 delta)
+        internal
+    {
+        if (delta == 0) return;
+        if (delta > 0) {
+            bucket[account] += uint256(delta);
+            totalDeposits += uint256(delta);
+        } else {
+            uint256 dec = uint256(-delta);
+            if (bucket[account] < dec) revert NegativeBalance();
+            bucket[account] -= dec;
+            totalDeposits -= dec;
+        }
     }
 
     function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) { }
