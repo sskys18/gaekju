@@ -35,7 +35,6 @@ contract Router is Initializable, UUPSUpgradeable, AccessControlUpgradeable, IRo
         uint256 forceIncludeFeeUsdc_
     ) external initializer {
         __AccessControl_init();
-        __UUPSUpgradeable_init();
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
 

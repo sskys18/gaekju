@@ -30,7 +30,6 @@ contract MarketFactory is Initializable, UUPSUpgradeable, AccessControlUpgradeab
 
     function initialize(address admin, address marginEngine_, address oracle_) external initializer {
         __AccessControl_init();
-        __UUPSUpgradeable_init();
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(ADMIN_ROLE, admin);

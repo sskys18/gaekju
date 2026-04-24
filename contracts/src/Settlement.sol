@@ -98,8 +98,8 @@ contract Settlement is ISettlement, Initializable, UUPSUpgradeable, AccessContro
         bytes32 _initialStateRoot
     ) external initializer {
         __AccessControl_init();
-        __Pausable_init();
-        __UUPSUpgradeable_init();
+        // OZ v5.6.1 drops Pausable + UUPS __init helpers; storage is
+        // lazily initialized via Initializable + modifier chain.
 
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
 
