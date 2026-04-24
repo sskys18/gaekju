@@ -1,6 +1,9 @@
 # Contracts v2 — Path B Settlement Rebuild
 
 **Date:** 2026-04-22
+**Status:** ✅ COMPLETE — merged to main as `98baf7c` on 2026-04-24.
+  Results matrix: [`2026-04-22-contracts-v2-results.md`](2026-04-22-contracts-v2-results.md).
+  T8 FundingRate deferred to Phase 5.5 miniplan; ADL placeholder deferred.
 **Supersedes:** `2026-04-06-phase3-funding-factory-router.md`
 **Governing ADR:** [ADR-0012](../adr/0012-zkvm-matcher-pivot.md)
 **For agentic workers:** REQUIRED SUB-SKILL: `sspower:subagent-driven-development` or `sspower:executing-plans`.

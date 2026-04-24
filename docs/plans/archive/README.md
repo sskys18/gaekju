@@ -8,7 +8,7 @@ Preserved for context; do **not** execute these. Path B (ADR-0012) is the live p
 
 - `../2026-04-06-phase1-foundation-core-orderbook.md` — partial supersede (Tasks 2, 3, 4, 10, 11 obsolete under Path B)
 - `../2026-04-06-phase2-positions-liquidation.md` — Task 4 caller-role rebind only; rest of plan survived
-- `../2026-04-06-phase3-funding-factory-router.md` — fully superseded by `../2026-04-22-contracts-v2.md`
+- `../2026-04-06-phase3-funding-factory-router.md` — fully superseded by `../2026-04-22-contracts-v2.md` (completed 2026-04-24)
 - `../2026-04-07-phase3-handoff.md` — historical
 - `../2026-04-06-phase3-codex-review.md` — partial historical
 
