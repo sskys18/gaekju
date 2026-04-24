@@ -1,0 +1,19 @@
+[package]
+name = "gaekju-matching-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["std", "serde"]
+std = ["alloy-primitives/std", "serde?/std", "thiserror/std"]
+serde = ["dep:serde", "alloy-primitives/serde"]
+zkvm = []
+
+[dependencies]
+alloy-primitives = { workspace = true, default-features = false, features = ["k256"] }
+serde = { workspace = true, optional = true, default-features = false, features = ["derive", "alloc"] }
+thiserror = { workspace = true, default-features = false }
+
+[dev-dependencies]
+alloy-signer-local = "1"
+proptest = "1"

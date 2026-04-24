@@ -1,0 +1,27 @@
+[package]
+name = "gaekju-sequencer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+axum = { workspace = true }
+bincode = { workspace = true }
+eyre = { workspace = true }
+futures-util = { workspace = true }
+gaekju-matching-core = { path = "../gaekju-matching-core" }
+gaekju-types = { path = "../gaekju-types" }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+alloy-signer = "1"
+alloy-signer-local = "1"
+tempfile = "3"
