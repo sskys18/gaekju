@@ -89,9 +89,7 @@ contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgr
 
                 if (wasEmpty) _positionHolders[f.marketId].add(f.account);
 
-                emit PositionUpdated(
-                    f.account, f.marketId, f.newSize, f.newEntryPrice, f.newCollateral, f.realizedPnl
-                );
+                emit PositionUpdated(f.account, f.marketId, f.newSize, f.newEntryPrice, f.newCollateral, f.realizedPnl);
             }
         }
 

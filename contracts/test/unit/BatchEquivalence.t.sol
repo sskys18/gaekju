@@ -38,7 +38,7 @@ contract BatchEquivalenceTest is Test {
     uint256 constant MARKET_ID = 0;
     uint256 constant TICK_SIZE = 0.1e18;
     uint256 constant IMR = 2e16; // 2%
-    uint64  constant BATCH_NONCE = 1;
+    uint64 constant BATCH_NONCE = 1;
     bytes32 constant PYTH_ID = bytes32(uint256(1));
 
     function setUp() public {
@@ -108,18 +108,19 @@ contract BatchEquivalenceTest is Test {
         s.vault.grantSettlement(address(s.pm));
         s.vault.grantSettlement(settlement);
         s.pm.grantRole(s.pm.SETTLEMENT_ROLE(), settlement);
-        s.engine.setMarketConfig(
-            MARKET_ID,
-            IMarginEngine.MarketConfig({
-                maxLeverage: 50e18,
-                initialMarginRate: IMR,
-                maintenanceMarginRate: 1e16,
-                tickSize: TICK_SIZE,
-                lotSize: 0.00001e18,
-                maxOrderSize: 100e18,
-                minOrderSize: 0.001e18
-            })
-        );
+        s.engine
+            .setMarketConfig(
+                MARKET_ID,
+                IMarginEngine.MarketConfig({
+                    maxLeverage: 50e18,
+                    initialMarginRate: IMR,
+                    maintenanceMarginRate: 1e16,
+                    tickSize: TICK_SIZE,
+                    lotSize: 0.00001e18,
+                    maxOrderSize: 100e18,
+                    minOrderSize: 0.001e18
+                })
+            );
         s.oracle.setMarketOracle(MARKET_ID, PYTH_ID, 60);
         vm.stopPrank();
     }
@@ -131,20 +132,12 @@ contract BatchEquivalenceTest is Test {
         assertEq(lp.size, bp.size, string.concat(scenario, ": size"));
         assertEq(lp.entryPrice, bp.entryPrice, string.concat(scenario, ": entryPrice"));
         assertEq(lp.collateral, bp.collateral, string.concat(scenario, ": collateral"));
+        assertEq(legacy.vault.balances(alice), batch.vault.balances(alice), string.concat(scenario, ": free balance"));
         assertEq(
-            legacy.vault.balances(alice),
-            batch.vault.balances(alice),
-            string.concat(scenario, ": free balance")
+            legacy.vault.lockedMargin(alice), batch.vault.lockedMargin(alice), string.concat(scenario, ": lockedMargin")
         );
         assertEq(
-            legacy.vault.lockedMargin(alice),
-            batch.vault.lockedMargin(alice),
-            string.concat(scenario, ": lockedMargin")
-        );
-        assertEq(
-            legacy.vault.orderMargin(alice),
-            batch.vault.orderMargin(alice),
-            string.concat(scenario, ": orderMargin")
+            legacy.vault.orderMargin(alice), batch.vault.orderMargin(alice), string.concat(scenario, ": orderMargin")
         );
     }
 
@@ -194,12 +187,18 @@ contract BatchEquivalenceTest is Test {
         _applyIncrease(
             batch,
             alice,
-            /*sizeDelta*/ int256(addSize),
-            /*fillPrice*/ 62_000e18,
-            /*marginDelta*/ 372e18,
-            /*newSize*/ int256(totalSize),
-            /*newEntry*/ newEntry,
-            /*newCollateral*/ newCollateral
+            /*sizeDelta*/
+            int256(addSize),
+            /*fillPrice*/
+            62_000e18,
+            /*marginDelta*/
+            372e18,
+            /*newSize*/
+            int256(totalSize),
+            /*newEntry*/
+            newEntry,
+            /*newCollateral*/
+            newCollateral
         );
         _assertStateEq("increase long");
     }
@@ -223,13 +222,20 @@ contract BatchEquivalenceTest is Test {
         _applyPartialClose(
             batch,
             alice,
-            /*sizeDelta*/ -int256(closeSize),
-            /*fillPrice*/ 65_000e18,
-            /*realized*/ realized,
-            /*propCollateral*/ propCollateral,
-            /*newSize*/ int256(0.6e18),
-            /*newCollateral*/ 1_200e18 - propCollateral,
-            /*newEntry*/ 60_000e18
+            /*sizeDelta*/
+            -int256(closeSize),
+            /*fillPrice*/
+            65_000e18,
+            /*realized*/
+            realized,
+            /*propCollateral*/
+            propCollateral,
+            /*newSize*/
+            int256(0.6e18),
+            /*newCollateral*/
+            1_200e18 - propCollateral,
+            /*newEntry*/
+            60_000e18
         );
         _assertStateEq("partial close profit");
     }
@@ -268,9 +274,7 @@ contract BatchEquivalenceTest is Test {
     }
 
     // ── Helpers: build + apply a one-fill batch. ──────────────────────────
-    function _applyOpen(Stack memory s, address account, int256 sizeDelta, uint256 fillPrice, uint256 margin)
-        internal
-    {
+    function _applyOpen(Stack memory s, address account, int256 sizeDelta, uint256 fillPrice, uint256 margin) internal {
         IVault.BalanceDelta[] memory d = new IVault.BalanceDelta[](1);
         // Legacy path: unlockOrderMargin(margin) then lockMargin(margin).
         // Net: orderMargin -= margin, lockedMargin += margin.

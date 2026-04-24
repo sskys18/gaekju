@@ -288,16 +288,13 @@ contract SettlementTest is Test {
         ISettlement.BatchBlob memory blob = _emptyBlob(1, bytes32(uint256(1)), 1);
         blob.forcedOutcomes = new ISettlement.ForcedOutcome[](1);
         blob.forcedOutcomes[0] = ISettlement.ForcedOutcome({
-            forcedIntentId: 1,
-            outcome: 1,
-            rejectReason: 0,
-            resultHash: bytes32(uint256(0xAA))
+            forcedIntentId: 1, outcome: 1, rejectReason: 0, resultHash: bytes32(uint256(0xAA))
         });
         ISettlement.ProofBundle memory bundle = _bundle(blob, bytes32(uint256(1)));
 
         settlement.applyBatch(bundle);
 
-        (,, , bool resolved, uint8 outcome,) = settlement.pendingForcedIntent(1);
+        (,,, bool resolved, uint8 outcome,) = settlement.pendingForcedIntent(1);
         assertTrue(resolved);
         assertEq(outcome, 1);
         assertEq(settlement.forceIncludeCursor(), 1);

@@ -16,13 +16,7 @@ import { IMarketFactory } from "./interfaces/IMarketFactory.sol";
 ///         spec §15). Verifies an SP1 proof over `BatchPublicInputs`, applies
 ///         the state delta to Vault/PM, and stores resolved forced-intent
 ///         outcomes. vkey rotation via pause-and-drain (spec §15.5).
-contract Settlement is
-    ISettlement,
-    Initializable,
-    UUPSUpgradeable,
-    AccessControlUpgradeable,
-    PausableUpgradeable
-{
+contract Settlement is ISettlement, Initializable, UUPSUpgradeable, AccessControlUpgradeable, PausableUpgradeable {
     // ── Errors ───────────────────────────────────────────────────────────
     error BatchHashMismatch();
     error ChainIdMismatch();
@@ -46,42 +40,42 @@ contract Settlement is
     error UnauthorizedForwarder();
 
     // ── Constants ────────────────────────────────────────────────────────
-    uint64 public constant FORCE_INCLUDE_N = 3;                 // ADR-0014, spec §15.2
-    uint64 public constant ROTATION_TIMELOCK = 24 hours;        // spec §15.5
-    uint64 public constant ROTATION_FORCE_TIMELOCK = 7 days;    // spec §15.5
-    uint256 public constant FORCE_INCLUDE_FEE = 1e18;           // 1 USDC in 18-dec
+    uint64 public constant FORCE_INCLUDE_N = 3; // ADR-0014, spec §15.2
+    uint64 public constant ROTATION_TIMELOCK = 24 hours; // spec §15.5
+    uint64 public constant ROTATION_FORCE_TIMELOCK = 7 days; // spec §15.5
+    uint256 public constant FORCE_INCLUDE_FEE = 1e18; // 1 USDC in 18-dec
 
     uint8 public constant OUTCOME_ACCEPTED = 1;
     uint8 public constant OUTCOME_REJECTED = 2;
     uint8 public constant REJECTED_SEQUENCER_FORCED_ROTATION = 99;
 
     // ── Dependencies ─────────────────────────────────────────────────────
-    ISP1Verifier   public verifier;
-    IVault         public vault;
+    ISP1Verifier public verifier;
+    IVault public vault;
     IPositionManager public positionManager;
-    address        public fundingRate;  // minimal placeholder until Phase 5.5
+    address public fundingRate; // minimal placeholder until Phase 5.5
     IMarketFactory public marketFactory;
-    address        public router;
+    address public router;
 
     // ── Core state ───────────────────────────────────────────────────────
     bytes32 public stateRoot;
-    uint64  public batchNonce;
-    uint64  public forceIncludeCursor;
+    uint64 public batchNonce;
+    uint64 public forceIncludeCursor;
 
     // ── vkey rotation state (spec §15.5) ─────────────────────────────────
     bytes32 public programVKey;
     bytes32 public pendingProgramVKey;
-    uint64  public vkeyProposalTimestamp;
-    uint64  public pausedSince;               // wall-clock of latest pause; 0 when unpaused
+    uint64 public vkeyProposalTimestamp;
+    uint64 public pausedSince; // wall-clock of latest pause; 0 when unpaused
 
     // ── Force-include queue ──────────────────────────────────────────────
     struct PendingForcedIntent {
         address trader;
         bytes32 intentDigest;
-        uint64  deadlineBatchNonce;
-        bool    resolved;
-        uint8   outcome;
-        uint8   rejectReason;
+        uint64 deadlineBatchNonce;
+        bool resolved;
+        uint8 outcome;
+        uint8 rejectReason;
         bytes32 resultHash;
     }
 
@@ -178,9 +172,7 @@ contract Settlement is
         forceIncludeCursor = pub.forceIncludeCursor;
 
         // 14. Emit.
-        emit BatchSettled(
-            pub.batchNonce, pub.prevStateRoot, pub.postStateRoot, pub.batchHash, pub.forceIncludeCursor
-        );
+        emit BatchSettled(pub.batchNonce, pub.prevStateRoot, pub.postStateRoot, pub.batchHash, pub.forceIncludeCursor);
     }
 
     function _assertOverdueCovered(uint64 currentBatchNonce, ForcedOutcome[] memory outcomes) internal view {
@@ -232,11 +224,22 @@ contract Settlement is
     }
 
     // ── forceInclude (spec §15.2/§15.3.4) ────────────────────────────────
-    function forceInclude(bytes calldata intent, bytes calldata /*sig*/) external payable whenNotPaused {
+    function forceInclude(
+        bytes calldata intent,
+        bytes calldata /*sig*/
+    )
+        external
+        payable
+        whenNotPaused
+    {
         _queueForcedIntent(msg.sender, intent);
     }
 
-    function forceIncludeFor(address trader, bytes calldata intent, bytes calldata /*sig*/)
+    function forceIncludeFor(
+        address trader,
+        bytes calldata intent,
+        bytes calldata /*sig*/
+    )
         external
         payable
         whenNotPaused
@@ -317,8 +320,8 @@ contract Settlement is
 
     struct ForceState {
         bytes32 postStateRoot;
-        uint64  batchNonce;
-        uint64  forceIncludeCursor;
+        uint64 batchNonce;
+        uint64 forceIncludeCursor;
     }
 
     function forceActivateProgramVKey(bytes32 next, ForceState calldata forceState)

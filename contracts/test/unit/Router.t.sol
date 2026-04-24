@@ -73,7 +73,15 @@ contract RouterTest is Test {
                     address(new Settlement()),
                     abi.encodeCall(
                         Settlement.initialize,
-                        (admin, address(verifier), address(vault), address(positionManager), address(0), bytes32(0), bytes32(0))
+                        (
+                            admin,
+                            address(verifier),
+                            address(vault),
+                            address(positionManager),
+                            address(0),
+                            bytes32(0),
+                            bytes32(0)
+                        )
                     )
                 )
             )

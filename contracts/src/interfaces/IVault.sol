@@ -8,11 +8,11 @@ interface IVault {
     // marks an insurance-fund-only row; all other rows use `account` as target.
     struct BalanceDelta {
         address account;
-        int256  freeDelta;
-        int256  lockedMarginDelta;
-        int256  orderMarginDelta;
-        int256  realizedPnlDelta;       // informational; credited via freeDelta
-        int256  insuranceFundDelta;
+        int256 freeDelta;
+        int256 lockedMarginDelta;
+        int256 orderMarginDelta;
+        int256 realizedPnlDelta; // informational; credited via freeDelta
+        int256 insuranceFundDelta;
     }
 
     function deposit(uint256 amount) external;

@@ -37,14 +37,11 @@ contract DeployCore is Script {
 
         address verifier = address(new MockSP1Verifier());
 
-        Vault vault = Vault(
-            address(new ERC1967Proxy(address(new Vault()), abi.encodeCall(Vault.initialize, (usdc, admin))))
-        );
+        Vault vault =
+            Vault(address(new ERC1967Proxy(address(new Vault()), abi.encodeCall(Vault.initialize, (usdc, admin)))));
         OracleAdapter oracle = OracleAdapter(
             address(
-                new ERC1967Proxy(
-                    address(new OracleAdapter()), abi.encodeCall(OracleAdapter.initialize, (pyth, admin))
-                )
+                new ERC1967Proxy(address(new OracleAdapter()), abi.encodeCall(OracleAdapter.initialize, (pyth, admin)))
             )
         );
         MarginEngine marginEngine = MarginEngine(
@@ -132,7 +129,10 @@ contract DeployCore is Script {
         settlement.setRouter(address(router));
 
         require(vault.hasRole(vault.SETTLEMENT_ROLE(), address(settlement)), "vault settlement role missing");
-        require(positionManager.hasRole(positionManager.SETTLEMENT_ROLE(), address(settlement)), "pm settlement role missing");
+        require(
+            positionManager.hasRole(positionManager.SETTLEMENT_ROLE(), address(settlement)),
+            "pm settlement role missing"
+        );
         require(vault.hasRole(vault.ROUTER_ROLE(), address(router)), "vault router role missing");
 
         vm.stopBroadcast();

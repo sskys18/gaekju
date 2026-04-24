@@ -40,11 +40,7 @@ contract MarketFactory is Initializable, UUPSUpgradeable, AccessControlUpgradeab
         _nextMarketId = 1;
     }
 
-    function createMarket(MarketParams calldata params)
-        external
-        onlyRole(ADMIN_ROLE)
-        returns (uint256 marketId)
-    {
+    function createMarket(MarketParams calldata params) external onlyRole(ADMIN_ROLE) returns (uint256 marketId) {
         marketId = _nextMarketId++;
         _marketParams[marketId] = params;
         _marketActive[marketId] = true;

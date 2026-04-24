@@ -65,5 +65,4 @@ contract OracleAdapterTest is Test {
         vm.expectRevert();
         oracle.getIndexPrice(MARKET_BTC);
     }
-
 }

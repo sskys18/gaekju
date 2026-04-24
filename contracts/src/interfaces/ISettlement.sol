@@ -10,27 +10,27 @@ interface ISettlement {
     struct BatchPublicInputs {
         bytes32 prevStateRoot;
         bytes32 postStateRoot;
-        bytes32 batchHash;            // keccak256(abi.encode(BatchBlob))
-        uint64  batchNonce;
-        uint64  chainId;
-        uint64  forceIncludeCursor;
+        bytes32 batchHash; // keccak256(abi.encode(BatchBlob))
+        uint64 batchNonce;
+        uint64 chainId;
+        uint64 forceIncludeCursor;
     }
 
     struct ProofBundle {
         BatchPublicInputs publicInputs;
-        bytes             sp1Proof;
-        bytes             batchBlob;   // canonical encoding (spec §15.2)
+        bytes sp1Proof;
+        bytes batchBlob; // canonical encoding (spec §15.2)
     }
 
     // ── Batch blob (spec §15.2, field order is load-bearing) ─────────────
     struct BatchHeader {
-        uint64  batchNonce;
+        uint64 batchNonce;
         bytes32 prevStateRoot;
-        uint64  timestamp;
-        uint32  intentCount;
-        uint32  fillCount;
-        uint32  forcedCount;
-        uint64  forceIncludeCursor;
+        uint64 timestamp;
+        uint32 intentCount;
+        uint32 fillCount;
+        uint32 forcedCount;
+        uint64 forceIncludeCursor;
     }
 
     struct MidPriceUpdate {
@@ -40,8 +40,8 @@ interface ISettlement {
 
     struct ForcedOutcome {
         uint256 forcedIntentId;
-        uint8   outcome;        // 1 = accepted, 2 = rejected
-        uint8   rejectReason;   // ForcedRejectReason; 0 if accepted
+        uint8 outcome; // 1 = accepted, 2 = rejected
+        uint8 rejectReason; // ForcedRejectReason; 0 if accepted
         bytes32 resultHash;
     }
 
@@ -52,14 +52,14 @@ interface ISettlement {
     }
 
     struct BatchBlob {
-        BatchHeader                 header;
-        ReplayedIntent[]            acceptedIntents;
-        IPositionManager.Fill[]     fills;
-        IVault.BalanceDelta[]       balanceDeltas;
-        MidPriceUpdate[]            midPriceUpdates;
-        ForcedOutcome[]             forcedOutcomes;
-        bytes32[]                   attestedPriceIds;
-        bytes32[]                   attestedPriceHashes;
+        BatchHeader header;
+        ReplayedIntent[] acceptedIntents;
+        IPositionManager.Fill[] fills;
+        IVault.BalanceDelta[] balanceDeltas;
+        MidPriceUpdate[] midPriceUpdates;
+        ForcedOutcome[] forcedOutcomes;
+        bytes32[] attestedPriceIds;
+        bytes32[] attestedPriceHashes;
     }
 
     // ── Entry points ─────────────────────────────────────────────────────
@@ -74,25 +74,17 @@ interface ISettlement {
 
     // ── Events (spec §15.3) ──────────────────────────────────────────────
     event BatchSettled(
-        uint64  indexed batchNonce,
-        bytes32         prevStateRoot,
-        bytes32         postStateRoot,
-        bytes32         batchHash,
-        uint64          forceIncludeCursor
+        uint64 indexed batchNonce,
+        bytes32 prevStateRoot,
+        bytes32 postStateRoot,
+        bytes32 batchHash,
+        uint64 forceIncludeCursor
     );
 
-    event ForcedIntentResolved(
-        uint256 indexed forcedIntentId,
-        uint8           outcome,
-        uint8           rejectReason,
-        bytes32         resultHash
-    );
+    event ForcedIntentResolved(uint256 indexed forcedIntentId, uint8 outcome, uint8 rejectReason, bytes32 resultHash);
 
     event ForceIncludeQueued(
-        uint256 indexed forcedIntentId,
-        address indexed trader,
-        bytes32         intentHash,
-        uint64          deadlineBatchNonce
+        uint256 indexed forcedIntentId, address indexed trader, bytes32 intentHash, uint64 deadlineBatchNonce
     );
 
     event ProgramVKeyProposed(bytes32 indexed newVKey, uint64 activateAfter);

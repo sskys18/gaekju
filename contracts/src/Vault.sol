@@ -33,7 +33,7 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
     mapping(address => uint256) public orderMargin;
     uint256 public insuranceFund;
     uint256 public totalDeposits;
-    uint64  public lastAppliedBatchNonce;
+    uint64 public lastAppliedBatchNonce;
 
     uint256[49] private __gap;
 
@@ -63,9 +63,9 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
     }
 
     function withdrawTo(address account, uint256 usdcAmount, address recipient) external nonReentrant {
-        if (msg.sender != account && !hasRole(ROUTER_ROLE, msg.sender)) revert AccessControlUnauthorizedAccount(
-            msg.sender, ROUTER_ROLE
-        );
+        if (msg.sender != account && !hasRole(ROUTER_ROLE, msg.sender)) {
+            revert AccessControlUnauthorizedAccount(msg.sender, ROUTER_ROLE);
+        }
         _withdrawInternal(account, usdcAmount * DECIMAL_SCALE, recipient);
     }
 
@@ -148,10 +148,7 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
     /// @dev spec §15.3 step 10. Sole writer for free/order/position-margin and
     ///      realized-PnL under Path B. Fills-conservation (§10) enforced: the
     ///      sum of all account deltas plus insuranceFundDelta equals zero.
-    function applyBatchDelta(uint64 batchNonce_, BalanceDelta[] calldata deltas)
-        external
-        onlyRole(SETTLEMENT_ROLE)
-    {
+    function applyBatchDelta(uint64 batchNonce_, BalanceDelta[] calldata deltas) external onlyRole(SETTLEMENT_ROLE) {
         if (batchNonce_ <= lastAppliedBatchNonce) revert StaleBatchNonce();
 
         int256 conservationSum;
@@ -159,8 +156,7 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
         for (uint256 i; i < deltas.length; ++i) {
             BalanceDelta calldata d = deltas[i];
 
-            conservationSum +=
-                d.freeDelta + d.lockedMarginDelta + d.orderMarginDelta + d.insuranceFundDelta;
+            conservationSum += d.freeDelta + d.lockedMarginDelta + d.orderMarginDelta + d.insuranceFundDelta;
 
             if (d.insuranceFundDelta != 0) {
                 if (d.insuranceFundDelta > 0) {
@@ -187,9 +183,7 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
         emit BatchDeltaApplied(batchNonce_, deltas.length);
     }
 
-    function _applyBucketDelta(mapping(address => uint256) storage bucket, address account, int256 delta)
-        internal
-    {
+    function _applyBucketDelta(mapping(address => uint256) storage bucket, address account, int256 delta) internal {
         if (delta == 0) return;
         if (delta > 0) {
             bucket[account] += uint256(delta);

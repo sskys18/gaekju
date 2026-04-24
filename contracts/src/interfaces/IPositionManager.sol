@@ -15,13 +15,13 @@ interface IPositionManager {
     struct Fill {
         address account;
         uint256 marketId;
-        int256  newSize;                  // 0 = closed
+        int256 newSize; // 0 = closed
         uint256 newEntryPrice;
         uint256 newCollateral;
-        int256  newCumulativeFunding;
-        int256  sizeDelta;                // event payload
-        uint256 fillPrice;                // event payload
-        int256  realizedPnl;              // event payload
+        int256 newCumulativeFunding;
+        int256 sizeDelta; // event payload
+        uint256 fillPrice; // event payload
+        int256 realizedPnl; // event payload
     }
 
     function applyBatchFills(uint64 batchNonce, Fill[] calldata fills) external;
