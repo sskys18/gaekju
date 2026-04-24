@@ -14,26 +14,21 @@ import { FixedPointMath } from "./libraries/FixedPointMath.sol";
 contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyGuard {
     using EnumerableSet for EnumerableSet.AddressSet;
 
-    error OnlyOrderBook();
     error OnlyLiquidationEngine();
     error NoPosition();
     error InsufficientBalance();
 
+    bytes32 public constant SETTLEMENT_ROLE = keccak256("SETTLEMENT_ROLE");
+
     IVault public vault;
     IMarginEngine public marginEngine;
     IOracleAdapter public oracle;
-    address public orderBook;
     address public liquidationEngine;
 
     mapping(address => mapping(uint256 => Position)) internal _positions;
     mapping(uint256 => EnumerableSet.AddressSet) internal _positionHolders;
 
     uint256[50] private __gap;
-
-    modifier onlyOrderBook() {
-        if (msg.sender != orderBook) revert OnlyOrderBook();
-        _;
-    }
 
     modifier onlyLiquidationEngine() {
         if (msg.sender != liquidationEngine) revert OnlyLiquidationEngine();
@@ -48,8 +43,8 @@ contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgr
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
     }
 
-    function setOrderBook(address _orderBook) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        orderBook = _orderBook;
+    function grantSettlement(address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(SETTLEMENT_ROLE, account);
     }
 
     function setLiquidationEngine(address _liquidationEngine) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -58,7 +53,7 @@ contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgr
 
     function updatePosition(address account, uint256 marketId, int256 sizeDelta, uint256 fillPrice, uint256 marginDelta)
         external
-        onlyOrderBook
+        onlyRole(SETTLEMENT_ROLE)
         nonReentrant
     {
         _updatePositionInternal(account, marketId, sizeDelta, fillPrice, marginDelta);

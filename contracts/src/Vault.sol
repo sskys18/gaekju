@@ -11,7 +11,7 @@ import { IVault } from "./interfaces/IVault.sol";
 contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    bytes32 public constant AUTHORIZED_ROLE = keccak256("AUTHORIZED_ROLE");
+    bytes32 public constant SETTLEMENT_ROLE = keccak256("SETTLEMENT_ROLE");
 
     /// @dev USDC uses 6 decimals; internal accounting uses 18. Scale factor = 1e12.
     uint256 internal constant DECIMAL_SCALE = 1e12;
@@ -37,8 +37,8 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
     }
 
-    function grantAuthorized(address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _grantRole(AUTHORIZED_ROLE, account);
+    function grantSettlement(address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(SETTLEMENT_ROLE, account);
     }
 
     function deposit(uint256 usdcAmount) external nonReentrant {
@@ -65,44 +65,44 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
         emit Withdrawn(msg.sender, internalAmount);
     }
 
-    function lockMargin(address account, uint256 amount) external onlyRole(AUTHORIZED_ROLE) {
+    function lockMargin(address account, uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
         if (balances[account] < amount) revert InsufficientBalance();
         balances[account] -= amount;
         lockedMargin[account] += amount;
         emit MarginLocked(account, amount);
     }
 
-    function unlockMargin(address account, uint256 amount) external onlyRole(AUTHORIZED_ROLE) {
+    function unlockMargin(address account, uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
         if (lockedMargin[account] < amount) revert InsufficientLockedMargin();
         lockedMargin[account] -= amount;
         balances[account] += amount;
         emit MarginUnlocked(account, amount);
     }
 
-    function lockOrderMargin(address account, uint256 amount) external onlyRole(AUTHORIZED_ROLE) {
+    function lockOrderMargin(address account, uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
         if (balances[account] < amount) revert InsufficientBalance();
         balances[account] -= amount;
         orderMargin[account] += amount;
         emit OrderMarginLocked(account, amount);
     }
 
-    function unlockOrderMargin(address account, uint256 amount) external onlyRole(AUTHORIZED_ROLE) {
+    function unlockOrderMargin(address account, uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
         if (orderMargin[account] < amount) revert InsufficientOrderMargin();
         orderMargin[account] -= amount;
         balances[account] += amount;
         emit OrderMarginUnlocked(account, amount);
     }
 
-    function transferToInsuranceFund(uint256 amount) external onlyRole(AUTHORIZED_ROLE) {
+    function transferToInsuranceFund(uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
         insuranceFund += amount;
     }
 
-    function drawFromInsuranceFund(uint256 amount) external onlyRole(AUTHORIZED_ROLE) {
+    function drawFromInsuranceFund(uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
         if (insuranceFund < amount) revert InsufficientInsuranceFund();
         insuranceFund -= amount;
     }
 
-    function realizePnl(address account, int256 pnl) external onlyRole(AUTHORIZED_ROLE) returns (uint256 deficit) {
+    function realizePnl(address account, int256 pnl) external onlyRole(SETTLEMENT_ROLE) returns (uint256 deficit) {
         if (pnl >= 0) {
             balances[account] += uint256(pnl);
             totalDeposits += uint256(pnl);

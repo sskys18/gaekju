@@ -11,7 +11,7 @@ contract VaultTest is Test {
     MockERC20 public usdc;
     address public alice = makeAddr("alice");
     address public bob = makeAddr("bob");
-    address public authorized = makeAddr("authorized");
+    address public settlement = makeAddr("settlement");
     address public admin = makeAddr("admin");
 
     function setUp() public {
@@ -23,9 +23,9 @@ contract VaultTest is Test {
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
         vault = Vault(address(proxy));
 
-        // Grant authorized role
+        // Grant SETTLEMENT_ROLE to test placeholder (Settlement.sol lands in T3)
         vm.prank(admin);
-        vault.grantAuthorized(authorized);
+        vault.grantSettlement(settlement);
 
         // Fund alice with 10,000 USDC (6 decimals)
         usdc.mint(alice, 10_000e6);
@@ -63,11 +63,11 @@ contract VaultTest is Test {
         vault.withdraw(1_001e18);
     }
 
-    function test_lockMargin_onlyAuthorized() public {
+    function test_lockMargin_onlySettlement() public {
         vm.prank(alice);
         vault.deposit(1_000e6);
 
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.lockMargin(alice, 500e18);
         assertEq(vault.balances(alice), 500e18);
         assertEq(vault.lockedMargin(alice), 500e18);
@@ -86,10 +86,10 @@ contract VaultTest is Test {
         vm.prank(alice);
         vault.deposit(1_000e6);
 
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.lockMargin(alice, 500e18);
 
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.unlockMargin(alice, 200e18);
 
         assertEq(vault.balances(alice), 700e18);
@@ -100,7 +100,7 @@ contract VaultTest is Test {
         vm.prank(alice);
         vault.deposit(1_000e6);
 
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.lockOrderMargin(alice, 300e18);
 
         assertEq(vault.balances(alice), 700e18);
@@ -111,10 +111,10 @@ contract VaultTest is Test {
         vm.prank(alice);
         vault.deposit(1_000e6);
 
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.lockOrderMargin(alice, 300e18);
 
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.unlockOrderMargin(alice, 300e18);
 
         assertEq(vault.balances(alice), 1_000e18);
@@ -125,7 +125,7 @@ contract VaultTest is Test {
         vm.prank(alice);
         vault.deposit(1_000e6);
 
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.realizePnl(alice, int256(200e18));
 
         assertEq(vault.balances(alice), 1_200e18);
@@ -135,7 +135,7 @@ contract VaultTest is Test {
         vm.prank(alice);
         vault.deposit(1_000e6);
 
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.realizePnl(alice, -int256(200e18));
 
         assertEq(vault.balances(alice), 800e18);
@@ -145,13 +145,13 @@ contract VaultTest is Test {
         vm.prank(alice);
         vault.deposit(1_000e6);
 
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.realizePnl(alice, -int256(100e18)); // take 100 from alice
         // In practice, insurance fund fees come from specific flows.
         // For this test, just transfer from alice's balance:
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.lockMargin(alice, 100e18);
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.transferToInsuranceFund(100e18);
 
         assertEq(vault.insuranceFund(), 100e18);
@@ -161,7 +161,7 @@ contract VaultTest is Test {
         vm.prank(alice);
         vault.deposit(1_000e6);
 
-        vm.prank(authorized);
+        vm.prank(settlement);
         vault.lockMargin(alice, 800e18);
 
         // Only 200 free
