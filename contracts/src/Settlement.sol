@@ -10,6 +10,7 @@ import { ISettlement } from "./interfaces/ISettlement.sol";
 import { ISP1Verifier } from "./interfaces/ISP1Verifier.sol";
 import { IVault } from "./interfaces/IVault.sol";
 import { IPositionManager } from "./interfaces/IPositionManager.sol";
+import { IMarketFactory } from "./interfaces/IMarketFactory.sol";
 
 /// @notice Single on-chain endpoint for proved matching batches (ADR-0012,
 ///         spec §15). Verifies an SP1 proof over `BatchPublicInputs`, applies
@@ -39,8 +40,10 @@ contract Settlement is
     error ForceRotationRequiresPausedThroughout();
     error NoPendingVKey();
     error PendingVKeyMismatch();
-    error ForceIncludeFeeRequired();
     error UnresolvedOverdueForced();
+    error MarketFactoryNotSet();
+    error MarketPaused(uint256 marketId);
+    error UnauthorizedForwarder();
 
     // ── Constants ────────────────────────────────────────────────────────
     uint64 public constant FORCE_INCLUDE_N = 3;                 // ADR-0014, spec §15.2
@@ -57,6 +60,8 @@ contract Settlement is
     IVault         public vault;
     IPositionManager public positionManager;
     address        public fundingRate;  // minimal placeholder until Phase 5.5
+    IMarketFactory public marketFactory;
+    address        public router;
 
     // ── Core state ───────────────────────────────────────────────────────
     bytes32 public stateRoot;
@@ -83,7 +88,10 @@ contract Settlement is
     mapping(uint256 => PendingForcedIntent) internal _pendingForced;
     uint256 public latestQueuedForcedId;
 
-    uint256[45] private __gap;
+    uint256[43] private __gap;
+
+    event MarketFactorySet(address indexed marketFactory);
+    event RouterSet(address indexed router);
 
     // ── Init ─────────────────────────────────────────────────────────────
     function initialize(
@@ -148,19 +156,20 @@ contract Settlement is
             emit ForcedIntentResolved(fo.forcedIntentId, fo.outcome, fo.rejectReason, fo.resultHash);
         }
 
-        // 8 + 10. Vault deltas (fills-conservation enforced inside Vault).
+        // 8. Reject paused or unknown markets before any state fan-out.
+        _assertMarketsActive(blob.fills, blob.midPriceUpdates);
+
+        // 9. Vault deltas (fills-conservation enforced inside Vault).
         vault.applyBatchDelta(pub.batchNonce, blob.balanceDeltas);
 
-        // 9. Market-pause check + 11. mid-price fan-out.
-        //    Market-active enforcement lands with MarketFactory (T6).
-        //    FundingRate mid sink is a minimal stub until Phase 5.5 (see
-        //    docs/plans/2026-04-22-contracts-v2.md).
+        // 10. FundingRate mid sink is a minimal stub until Phase 5.5 (see
+        //     docs/plans/2026-04-22-contracts-v2.md).
         _dispatchMidPriceUpdates(blob.midPriceUpdates);
 
-        // 12. Position state.
+        // 11. Position state.
         positionManager.applyBatchFills(pub.batchNonce, blob.fills);
 
-        // 4 (final). Contiguity check now that forced outcomes applied.
+        // 12. Contiguity check now that forced outcomes applied.
         if (!_cursorContiguous(pub.forceIncludeCursor)) revert CursorNotContiguous();
 
         // 13. Persist state.
@@ -202,6 +211,19 @@ contract Settlement is
         return true;
     }
 
+    function _assertMarketsActive(IPositionManager.Fill[] memory fills, MidPriceUpdate[] memory updates) internal view {
+        if (fills.length == 0 && updates.length == 0) return;
+        if (address(marketFactory) == address(0)) revert MarketFactoryNotSet();
+
+        for (uint256 i; i < fills.length; ++i) {
+            if (!marketFactory.marketActive(fills[i].marketId)) revert MarketPaused(fills[i].marketId);
+        }
+
+        for (uint256 i; i < updates.length; ++i) {
+            if (!marketFactory.marketActive(updates[i].marketId)) revert MarketPaused(updates[i].marketId);
+        }
+    }
+
     function _dispatchMidPriceUpdates(MidPriceUpdate[] memory updates) internal view {
         // Phase 5.5: FundingRate.updateSequencerMid(marketId, mid). Ignore
         // for now — no-op stub so Settlement can ship ahead of FundingRate.
@@ -211,15 +233,24 @@ contract Settlement is
 
     // ── forceInclude (spec §15.2/§15.3.4) ────────────────────────────────
     function forceInclude(bytes calldata intent, bytes calldata /*sig*/) external payable whenNotPaused {
-        // v1: fee denominated in Vault-internal USDC. Router handles fee
-        // collection off this entry point; keep the charge symbolic here.
-        if (msg.value == 0) revert ForceIncludeFeeRequired();
+        _queueForcedIntent(msg.sender, intent);
+    }
 
+    function forceIncludeFor(address trader, bytes calldata intent, bytes calldata /*sig*/)
+        external
+        payable
+        whenNotPaused
+    {
+        if (msg.sender != router) revert UnauthorizedForwarder();
+        _queueForcedIntent(trader, intent);
+    }
+
+    function _queueForcedIntent(address trader, bytes calldata intent) internal {
         uint256 id = ++latestQueuedForcedId;
         bytes32 digest = keccak256(intent);
 
         _pendingForced[id] = PendingForcedIntent({
-            trader: msg.sender,
+            trader: trader,
             intentDigest: digest,
             deadlineBatchNonce: batchNonce + FORCE_INCLUDE_N,
             resolved: false,
@@ -228,7 +259,7 @@ contract Settlement is
             resultHash: bytes32(0)
         });
 
-        emit ForceIncludeQueued(id, msg.sender, digest, batchNonce + FORCE_INCLUDE_N);
+        emit ForceIncludeQueued(id, trader, digest, batchNonce + FORCE_INCLUDE_N);
     }
 
     function pendingForcedIntent(uint256 id)
@@ -245,6 +276,16 @@ contract Settlement is
     {
         PendingForcedIntent storage p = _pendingForced[id];
         return (p.trader, p.intentDigest, p.deadlineBatchNonce, p.resolved, p.outcome, p.rejectReason);
+    }
+
+    function setMarketFactory(address nextMarketFactory) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        marketFactory = IMarketFactory(nextMarketFactory);
+        emit MarketFactorySet(nextMarketFactory);
+    }
+
+    function setRouter(address nextRouter) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        router = nextRouter;
+        emit RouterSet(nextRouter);
     }
 
     // ── vkey rotation (spec §15.5) ───────────────────────────────────────

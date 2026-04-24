@@ -12,6 +12,7 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
     using SafeERC20 for IERC20;
 
     bytes32 public constant SETTLEMENT_ROLE = keccak256("SETTLEMENT_ROLE");
+    bytes32 public constant ROUTER_ROLE = keccak256("ROUTER_ROLE");
 
     /// @dev USDC uses 6 decimals; internal accounting uses 18. Scale factor = 1e12.
     uint256 internal constant DECIMAL_SCALE = 1e12;
@@ -45,28 +46,38 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
         _grantRole(SETTLEMENT_ROLE, account);
     }
 
+    function grantRouter(address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(ROUTER_ROLE, account);
+    }
+
     function deposit(uint256 usdcAmount) external nonReentrant {
+        _deposit(msg.sender, usdcAmount);
+    }
+
+    function depositFor(address account, uint256 usdcAmount) external nonReentrant {
+        _deposit(account, usdcAmount);
+    }
+
+    function withdraw(uint256 internalAmount) external nonReentrant {
+        _withdrawInternal(msg.sender, internalAmount, msg.sender);
+    }
+
+    function withdrawTo(address account, uint256 usdcAmount, address recipient) external nonReentrant {
+        if (msg.sender != account && !hasRole(ROUTER_ROLE, msg.sender)) revert AccessControlUnauthorizedAccount(
+            msg.sender, ROUTER_ROLE
+        );
+        _withdrawInternal(account, usdcAmount * DECIMAL_SCALE, recipient);
+    }
+
+    function depositInsuranceFund(uint256 usdcAmount) external nonReentrant {
         if (usdcAmount == 0) revert ZeroAmount();
         uint256 internalAmount = usdcAmount * DECIMAL_SCALE;
 
         usdc.safeTransferFrom(msg.sender, address(this), usdcAmount);
-        balances[msg.sender] += internalAmount;
+        insuranceFund += internalAmount;
         totalDeposits += internalAmount;
 
-        emit Deposited(msg.sender, internalAmount);
-    }
-
-    function withdraw(uint256 internalAmount) external nonReentrant {
-        if (internalAmount == 0) revert ZeroAmount();
-        if (balances[msg.sender] < internalAmount) revert InsufficientBalance();
-
-        balances[msg.sender] -= internalAmount;
-        totalDeposits -= internalAmount;
-        uint256 usdcAmount = internalAmount / DECIMAL_SCALE;
-
-        usdc.safeTransfer(msg.sender, usdcAmount);
-
-        emit Withdrawn(msg.sender, internalAmount);
+        emit InsuranceFundDeposited(msg.sender, internalAmount);
     }
 
     function lockMargin(address account, uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
@@ -189,6 +200,29 @@ contract Vault is IVault, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyG
             bucket[account] -= dec;
             totalDeposits -= dec;
         }
+    }
+
+    function _deposit(address account, uint256 usdcAmount) internal {
+        if (usdcAmount == 0) revert ZeroAmount();
+        uint256 internalAmount = usdcAmount * DECIMAL_SCALE;
+
+        usdc.safeTransferFrom(msg.sender, address(this), usdcAmount);
+        balances[account] += internalAmount;
+        totalDeposits += internalAmount;
+
+        emit Deposited(account, internalAmount);
+    }
+
+    function _withdrawInternal(address account, uint256 internalAmount, address recipient) internal {
+        if (internalAmount == 0) revert ZeroAmount();
+        if (balances[account] < internalAmount) revert InsufficientBalance();
+
+        balances[account] -= internalAmount;
+        totalDeposits -= internalAmount;
+
+        usdc.safeTransfer(recipient, internalAmount / DECIMAL_SCALE);
+
+        emit Withdrawn(account, internalAmount);
     }
 
     function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) { }

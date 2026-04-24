@@ -17,6 +17,9 @@ interface IVault {
 
     function deposit(uint256 amount) external;
     function withdraw(uint256 amount) external;
+    function depositFor(address account, uint256 usdcAmount) external;
+    function withdrawTo(address account, uint256 usdcAmount, address recipient) external;
+    function depositInsuranceFund(uint256 usdcAmount) external;
 
     function applyBatchDelta(uint64 batchNonce, BalanceDelta[] calldata deltas) external;
     function lastAppliedBatchNonce() external view returns (uint64);
@@ -42,5 +45,6 @@ interface IVault {
     event OrderMarginLocked(address indexed account, uint256 amount);
     event OrderMarginUnlocked(address indexed account, uint256 amount);
     event PnlRealized(address indexed account, int256 amount);
+    event InsuranceFundDeposited(address indexed account, uint256 amount);
     event BatchDeltaApplied(uint64 indexed batchNonce, uint256 deltaCount);
 }

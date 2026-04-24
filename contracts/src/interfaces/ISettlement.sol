@@ -65,6 +65,7 @@ interface ISettlement {
     // ── Entry points ─────────────────────────────────────────────────────
     function applyBatch(ProofBundle calldata bundle) external;
     function forceInclude(bytes calldata intent, bytes calldata sig) external payable;
+    function forceIncludeFor(address trader, bytes calldata intent, bytes calldata sig) external payable;
 
     function stateRoot() external view returns (bytes32);
     function batchNonce() external view returns (uint64);

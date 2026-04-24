@@ -3,7 +3,9 @@ pragma solidity ^0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 import { Settlement } from "../../src/Settlement.sol";
+import { MarketFactory } from "../../src/MarketFactory.sol";
 import { ISettlement } from "../../src/interfaces/ISettlement.sol";
+import { IMarketFactory } from "../../src/interfaces/IMarketFactory.sol";
 import { Vault } from "../../src/Vault.sol";
 import { PositionManager } from "../../src/PositionManager.sol";
 import { MarginEngine } from "../../src/MarginEngine.sol";
@@ -22,6 +24,7 @@ contract SettlementTest is Test {
     PositionManager public pm;
     MarginEngine public engine;
     OracleAdapter public oracle;
+    MarketFactory public marketFactory;
     MockSP1Verifier public verifier;
     MockERC20 public usdc;
     MockPyth public mockPyth;
@@ -33,6 +36,7 @@ contract SettlementTest is Test {
     bytes32 constant INITIAL_ROOT = bytes32(uint256(0xC0FFEE));
     bytes32 constant PROGRAM_VKEY = bytes32(uint256(0xBEEF));
     bytes32 constant PYTH_ID = bytes32(uint256(1));
+    uint256 constant ACTIVE_MARKET_ID = 1;
 
     function setUp() public {
         usdc = new MockERC20("USDC", "USDC", 6);
@@ -87,10 +91,21 @@ contract SettlementTest is Test {
                 )
             )
         );
+        marketFactory = MarketFactory(
+            address(
+                new ERC1967Proxy(
+                    address(new MarketFactory()),
+                    abi.encodeCall(MarketFactory.initialize, (admin, address(engine), address(oracle)))
+                )
+            )
+        );
 
         vm.startPrank(admin);
         vault.grantSettlement(address(settlement));
         pm.grantRole(pm.SETTLEMENT_ROLE(), address(settlement));
+        engine.grantRole(0x00, address(marketFactory));
+        oracle.grantRole(0x00, address(marketFactory));
+        settlement.setMarketFactory(address(marketFactory));
         engine.setMarketConfig(
             MARKET_ID,
             IMarginEngine.MarketConfig({
@@ -104,6 +119,22 @@ contract SettlementTest is Test {
             })
         );
         oracle.setMarketOracle(MARKET_ID, PYTH_ID, 60);
+        marketFactory.createMarket(
+            IMarketFactory.MarketParams({
+                tickSize: 0.1e18,
+                lotSize: 0.00001e18,
+                initialMarginRate: 2e16,
+                maintenanceMarginRate: 1e16,
+                pythPriceId: bytes32(uint256(2)),
+                oracleStalenessThreshold: 60,
+                fundingInterval: 1 hours,
+                maxFundingRate: 5e15,
+                minOrderSize: 0.001e18,
+                maxOrderSize: 100e18,
+                makerFeeRate: 5e14,
+                takerFeeRate: 1e15
+            })
+        );
         vm.stopPrank();
 
         vm.warp(1_000_000);
@@ -270,6 +301,43 @@ contract SettlementTest is Test {
         assertTrue(resolved);
         assertEq(outcome, 1);
         assertEq(settlement.forceIncludeCursor(), 1);
+    }
+
+    function test_applyBatch_pausedFillMarket_reverts() public {
+        vm.prank(admin);
+        marketFactory.pauseMarket(ACTIVE_MARKET_ID);
+
+        ISettlement.BatchBlob memory blob = _emptyBlob(1, bytes32(uint256(1)), 0);
+        blob.fills = new IPositionManager.Fill[](1);
+        blob.fills[0] = IPositionManager.Fill({
+            account: alice,
+            marketId: ACTIVE_MARKET_ID,
+            newSize: 1e18,
+            newEntryPrice: 60_000e18,
+            newCollateral: 1_000e18,
+            newCumulativeFunding: 0,
+            sizeDelta: 1e18,
+            fillPrice: 60_000e18,
+            realizedPnl: 0
+        });
+        blob.header.fillCount = 1;
+
+        ISettlement.ProofBundle memory bundle = _bundle(blob, bytes32(uint256(1)));
+        vm.expectRevert(abi.encodeWithSelector(Settlement.MarketPaused.selector, ACTIVE_MARKET_ID));
+        settlement.applyBatch(bundle);
+    }
+
+    function test_applyBatch_pausedMidPriceMarket_reverts() public {
+        vm.prank(admin);
+        marketFactory.pauseMarket(ACTIVE_MARKET_ID);
+
+        ISettlement.BatchBlob memory blob = _emptyBlob(1, bytes32(uint256(1)), 0);
+        blob.midPriceUpdates = new ISettlement.MidPriceUpdate[](1);
+        blob.midPriceUpdates[0] = ISettlement.MidPriceUpdate({ marketId: ACTIVE_MARKET_ID, mid: 60_000e18 });
+
+        ISettlement.ProofBundle memory bundle = _bundle(blob, bytes32(uint256(1)));
+        vm.expectRevert(abi.encodeWithSelector(Settlement.MarketPaused.selector, ACTIVE_MARKET_ID));
+        settlement.applyBatch(bundle);
     }
 
     // ── vkey rotation ────────────────────────────────────────────────────
