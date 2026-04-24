@@ -30,11 +30,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
       - name: Install dependencies
+        # Pin versions to match local dev (OZ 5.6.1). Floating master was
+        # pulling an incompatible OZ Upgradeable that dropped
+        # __UUPSUpgradeable_init, breaking Settlement.sol CI builds.
         run: |
-          forge install OpenZeppelin/openzeppelin-contracts --no-git
-          forge install OpenZeppelin/openzeppelin-contracts-upgradeable --no-git
-          forge install pyth-network/pyth-sdk-solidity --no-git
-          forge install foundry-rs/forge-std --no-git
+          forge install OpenZeppelin/openzeppelin-contracts@v5.6.1 --no-git
+          forge install OpenZeppelin/openzeppelin-contracts-upgradeable@v5.6.1 --no-git
+          forge install pyth-network/pyth-sdk-solidity@v4.0.0 --no-git
+          forge install foundry-rs/forge-std@v1.9.7 --no-git
       - run: forge fmt --check
       - run: forge build
       - run: forge test -vvv
