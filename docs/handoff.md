@@ -1,77 +1,55 @@
 # Session Handoff
-> Generated: 2026-04-24 — after contracts-v2 merge to main
+> Generated: 2026-04-24 12:23 — after rust-sequencer merge + CI fix
 
 ## Task
-Path B Phase 5 execution. `contracts-v2` plan **complete and merged to main** (`98baf7c`). Next: Rust sequencer → Rust prover → indexer/api/keeper/sdk updates. Per handoff-before-this, three parallel plans remain.
+Path B Phase 5 execution. `contracts-v2` + `rust-sequencer` both merged to main and CI-green. Next: `rust-prover` → `indexer-api` → Phase 5.5 FundingRate miniplan.
 
 ## Status
 
 ### Completed this session
-- Executed `docs/plans/2026-04-22-contracts-v2.md` T1 → T10 on branch `pivot/contracts-v2`.
-- Merged `pivot/contracts-v2` → `main` as `98baf7c` (no-ff). Both refs pushed to `origin`.
-- Results matrix: `docs/plans/2026-04-22-contracts-v2-results.md`.
-- Tests: 103/103 green. OrderBook/BitmapLib/TickMath/PackedOrder/ORDERBOOK_ROLE symbols absent from `contracts/`.
-
-### Commits on main (this session)
-```
-98baf7c merge pivot/contracts-v2 — Path B contracts rebuild
-a566c3b chore(contracts): T10 — forge fmt + results doc + src tidy
-0ba8e51 test(contracts): T9b — rewrite LiquidationEngine unit tests (Path B)
-5001cfe test(contracts): T9 — end-to-end Settlement batch integration
-0c33b6c feat(contracts): T6+T7 — MarketFactory + Router + DeployCore
-e084ddc feat(contracts): T3 — ISettlement + Settlement.sol skeleton
-8892204 feat(contracts): T4 — Vault/PM batch entry points + equivalence gate
-909720a refactor(contracts): T2 — rebind AUTHORIZED_ROLE → SETTLEMENT_ROLE
-85ce34a refactor(contracts): T1 — delete bitmap orderbook surface
-```
-
-### Deferred from contracts-v2
-- **T8 FundingRate** — not built in v1 per B2 scope decision. Phase 5.5 miniplan needed before rust-sequencer consumes funding. Settlement wires a stub `address fundingRate` slot; mid-price updates are a no-op loop in `_dispatchMidPriceUpdates`.
-- **ADL placeholder** — LiquidationEngine unit tests omitted ADL path. Track when liquidation cascade design lands.
+- Executed `docs/plans/2026-04-22-contracts-v2.md` T1-T10 (minus T8). Merged `pivot/contracts-v2` → `main` as `98baf7c`.
+- Executed `docs/plans/2026-04-22-rust-sequencer.md` T1-T10 via codex. Merged `rust/sequencer` → `main` as `6545fcf`.
+- Fixed main CI (OZ lib pinning + drop `__Pausable_init` / `__UUPSUpgradeable_init` calls which don't exist in vanilla OZ v5.6.1). Local `contracts/lib/openzeppelin-contracts-upgradeable` was patched to re-add them, masking the break — see `6600cbb`, `56104d4`, `ee30bbd`.
+- Last green CI: run `24870314487` (contracts + rust both success).
 
 ### In Progress
-Nothing mid-flight. Clean worktree on `main`.
+Nothing mid-flight. Clean worktree on `main`. Branches `pivot/contracts-v2` + `rust/sequencer` remain on origin.
 
-## Resume Here — Phase 5 continuation
-1. Pick the next plan:
-   - `docs/plans/2026-04-22-rust-sequencer.md` — 10 tasks, `gaekju-matching-core` + `gaekju-sequencer` crates (alloy + axum + tokio-tungstenite + sled).
-   - `docs/plans/2026-04-22-rust-prover.md` — SP1 guest + public-inputs commit + prover service + Giwa submitter.
-   - `docs/plans/2026-04-22-indexer-api-updates.md` — indexer/api/keeper/mirror/sdk/cli.
-2. `rust-sequencer` unblocks the other two. Start there.
-3. Execution style options:
-   - Sequential via `sspower:executing-plans` (this session pattern).
-   - Codex delegation via `codex-bridge.mjs implement --write` (this session used that for T6-T10; worked well, sandbox blocks `.git` writes so commits apply locally from the host).
-   - Parallel via `sspower:subagent-driven-development` — sequencer + prover share `gaekju-matching-core`, so they are NOT fully independent; sequencer Task 1-2 must land before prover can reuse matching-core.
+## Resume Here
+Pick one of:
+1. **Rust prover** — `docs/plans/2026-04-22-rust-prover.md`. Cut `feat/rust-prover`, delegate T1-N via `codex-bridge.mjs implement --write --effort high`. Use the same briefing pattern from the in-session codex calls (see message history for T6+T7 and T1-T10 rust-sequencer prompts — both worked).
+2. **Indexer / API / keeper / SDK / CLI updates** — `docs/plans/2026-04-22-indexer-api-updates.md`. Smaller scope; touches existing crates. Independent of prover, can parallel.
+3. **FundingRate Phase 5.5** — no plan written yet. Needed before mark-price blend reattaches. Settlement has a `fundingRate` slot but `_dispatchMidPriceUpdates` is a no-op. Write `docs/plans/2026-04-24-funding-rate-phase5p5.md` first via `sspower:writing-plans`, then execute.
+
+Parallel option: run prover + indexer-api in two background codex shots — they don't share files.
 
 ## Decisions (don't re-debate)
 
-### Carried over from prior handoff
-- Global Settlement (one contract, multi-market batches).
-- vkey rotation: storage-backed + pause-and-drain (24h normal, 7d + paused-throughout force).
-- Liquidation: on-chain only v1; no sequencer-routed `kind=Liquidate`.
-- `ProofBundle` public inputs: `(prevStateRoot, postStateRoot, batchHash, batchNonce, chainId, forceIncludeCursor)`.
-- Event: `BatchSettled`.
-- Forced vs accepted intents: disjoint lists.
-- Funding mark source: sequencer mid (60s staleness → pure oracle fallback); `MidPriceUpdate[]` sibling array, Settlement dispatches directly to FundingRate.
-- Vault/PM split: Vault sole bucket-writer; PM position-state only.
-- Batch cadence: 5s; `FORCE_INCLUDE_N = 3` batches (~15s).
+### Carried over
+- Global Settlement, vkey pause-and-drain rotation, on-chain-only liquidation v1, forced-vs-accepted disjoint lists, 5s batch cadence, `FORCE_INCLUDE_N = 3`, Vault sole bucket-writer, PM position-state only.
+- Canonical `BatchBlob` field order (spec §15.2, load-bearing for hash): `(header, acceptedIntents, fills, balanceDeltas, midPriceUpdates, forcedOutcomes, attestedPriceIds, attestedPriceHashes)`.
 
-### New this session
-- **T8 FundingRate deferred to Phase 5.5.** Settlement ships without FundingRate; mid-price dispatch is a no-op. Rust sequencer should still emit `MidPriceUpdate[]` entries — Settlement accepts them. Rewire when FundingRate lands.
-- **Router model.** Router is thin, but Vault grew a `ROUTER_ROLE` (`depositFor`, `withdrawTo`, `depositInsuranceFund`) and Settlement grew `forceIncludeFor(trader, …)` so Router preserves end-user trader identity on force-include without collapsing caller identity to the router address.
-- **Intent decoding v1.** `Router.forceInclude` treats first 32 bytes of intent payload as `marketId`. Placeholder until EIP-712 envelope lands in rust-sequencer Task 3.
-- **PnL sink for equivalence test.** `BatchEquivalence.t.sol` uses `address(0xBEEF)` as a counterparty to satisfy fills-conservation on one-fill gate batches. Not a production artifact.
-- **Sandbox `.git` write.** `codex-bridge.mjs implement --write` cannot create commits in this sandbox (`Operation not permitted` on `.git/index.lock`). Work lands in the working tree; the host commits. Carry this forward.
+### This session
+- **FundingRate deferred to Phase 5.5**. Sequencer emits `MidPriceUpdate[]` entries; Settlement's `_dispatchMidPriceUpdates` is a no-op. Rewire when FundingRate lands.
+- **Router model**: thin shim, but Vault gained `ROUTER_ROLE` + `depositFor`/`withdrawTo`/`depositInsuranceFund` and Settlement gained `forceIncludeFor(trader,…)` so end-user identity survives the router hop.
+- **v1 intent encoding for Router.forceInclude**: first 32 bytes of intent payload = `marketId`. Placeholder until EIP-712 envelope lands in prover/sequencer cross-check.
+- **OZ pin**: CI + local must agree on v5.6.1 of contracts + contracts-upgradeable; local lib had been patched. Any future Upgradeable helper that isn't in vanilla OZ v5.6.1 will break CI again — cross-check against `https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts-upgradeable/v5.6.1/...`.
+- **Codex bridge sandbox**: `codex-bridge.mjs implement --write` cannot write `.git/index.lock` in its sandbox. Work lands in the worktree; host commits manually.
 
-## Gotchas (still valid)
-- `BatchBlob` field order load-bearing for `keccak256(abi.encode(BatchBlob)) == batchHash`. Rust host, SP1 guest, Solidity decoder must agree: `(header, acceptedIntents, fills, balanceDeltas, midPriceUpdates, forcedOutcomes, attestedPriceIds, attestedPriceHashes)`. Spec §15.2.
-- `BatchPublicInputs` uses `uint64`; Solidity `abi.encode` pads to `uint256`. Rust `abi_encode` must match; round-trip test required in rust-prover Task 3.
-- `PositionManager.applyBatchFills` MUST NOT call `vault.*` inline; BatchEquivalence gate enforces this. Rust matcher must emit the corresponding `BalanceDelta[]` for every fill.
-- `forge test --root contracts` can crash in Codex's sandbox on Foundry's macOS system-configuration path; `--offline` works. Local host runs both fine.
+## Gotchas
+- `BatchPublicInputs` uses `uint64`; Solidity `abi.encode` pads to `uint256`. Rust `abi_encode` must match — round-trip test required (rust-prover T3).
+- `PositionManager.applyBatchFills` MUST NOT call `vault.*` inline. `BatchEquivalence.t.sol` gate enforces this. Prover guest must emit matching `BalanceDelta[]` for every fill.
+- `BatchEquivalence.t.sol` uses `PNL_SINK = address(0xBEEF)` as counterparty. Not production — real matcher emits maker+taker legs.
+- `forge test --root contracts` can panic in codex's macOS sandbox on Foundry's system-configuration path; use `--offline`. Local host fine.
+- Previous `docs/handoff.md` (generated 2026-04-24 after contracts-v2 merge) has been superseded by this file. The file before that — `docs/plans/2026-04-22-path-b-handoff.md` — is historical.
 
 ## Context
-- **Branch**: `main` (pushed, clean).
-- **Tests (contracts)**: 103 forge tests green. Rust crates green `cargo check` but Path B crates not yet built.
-- **Superseded**: `2026-04-22-path-b-handoff.md` (pre-contracts-v2), prior `docs/handoff.md` (generated 2026-04-23, now replaced by this file).
+- **Branch**: `main` (pushed, clean). `pivot/contracts-v2` + `rust/sequencer` preserved on `origin`.
+- **Tests**:
+  - `forge test --root contracts`: 103/103 green.
+  - `cargo test --workspace`: 9 suites across matching-core + sequencer + types + existing crates, all green.
+  - `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+  - `cargo check -p gaekju-matching-core --no-default-features --features zkvm`: clean (SP1 guest compile path).
+- **Last commits**: `6545fcf`, `6600cbb`, `56104d4`, `ee30bbd`, `2b57e55`.
 - **Governing ADR**: `docs/adr/0012-zkvm-matcher-pivot.md`.
-- **Canonical spec**: `docs/specs/2026-04-06-gaekju-design.md` §14 (Proof System), §15 (Settlement Contract), §15.3.1 (Vault/PM split), §15.5 (vkey rotation), §16 (Soft-Confirm UX).
+- **Canonical spec**: `docs/specs/2026-04-06-gaekju-design.md` §14-§17.
