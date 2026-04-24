@@ -4,9 +4,7 @@ pragma solidity ^0.8.28;
 import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import { AccessControlUpgradeable } from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import { IOracleAdapter } from "./interfaces/IOracleAdapter.sol";
-import { IOrderBook } from "./interfaces/IOrderBook.sol";
 import { FixedPointMath } from "./libraries/FixedPointMath.sol";
-import { TickMath } from "./libraries/TickMath.sol";
 
 interface IMockPyth {
     struct PriceData {
@@ -37,7 +35,8 @@ contract OracleAdapter is IOracleAdapter, UUPSUpgradeable, AccessControlUpgradea
     IMockPyth public pyth;
 
     mapping(uint256 => MarketOracle) public marketOracles;
-    mapping(uint256 => address) public orderBooks; // marketId -> OrderBook (for mid-price)
+    // Path B: sequencer-fed mid (wired via FundingRate in Task 8). Slot kept for storage compat.
+    mapping(uint256 => address) public __deprecated_orderBooks;
     mapping(uint256 => uint256) public tickSizes; // cached from MarginEngine config
 
     uint256[50] private __gap;
@@ -54,10 +53,6 @@ contract OracleAdapter is IOracleAdapter, UUPSUpgradeable, AccessControlUpgradea
         marketOracles[marketId] = MarketOracle(pythPriceId, stalenessThreshold);
     }
 
-    function setOrderBook(uint256 marketId, address orderBook) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        orderBooks[marketId] = orderBook;
-    }
-
     function setTickSize(uint256 marketId, uint256 tickSize) external onlyRole(DEFAULT_ADMIN_ROLE) {
         tickSizes[marketId] = tickSize;
     }
@@ -67,28 +62,9 @@ contract OracleAdapter is IOracleAdapter, UUPSUpgradeable, AccessControlUpgradea
     }
 
     function getMarkPrice(uint256 marketId) public view returns (uint256) {
-        uint256 oraclePrice = _getOraclePrice(marketId);
-
-        address ob = orderBooks[marketId];
-        if (ob == address(0)) return oraclePrice;
-
-        uint256 tickSize = tickSizes[marketId];
-        if (tickSize == 0) return oraclePrice;
-
-        // Try to get mid-price from orderbook
-        uint256 bestBid = IOrderBook(ob).bestBidTick();
-        uint256 bestAsk = IOrderBook(ob).bestAskTick();
-
-        if (bestBid == 0 || bestAsk == 0) return oraclePrice;
-
-        uint256 bidPrice = TickMath.tickToPrice(bestBid, tickSize);
-        uint256 askPrice = TickMath.tickToPrice(bestAsk, tickSize);
-        uint256 midPrice = (bidPrice + askPrice) / 2;
-
-        if (midPrice == 0) return oraclePrice;
-
-        // Blend: 70% oracle + 30% orderbook mid
-        return FixedPointMath.mulFp(oraclePrice, 0.7e18) + FixedPointMath.mulFp(midPrice, 0.3e18);
+        // Path B: mid-price blend will be wired via FundingRate sequencer mid in Task 8.
+        // Until then, mark == oracle index (70/30 blend reattaches once FundingRate lands).
+        return _getOraclePrice(marketId);
     }
 
     function updatePrice(uint256 marketId, bytes[] calldata priceUpdateData) external payable {
