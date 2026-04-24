@@ -14,26 +14,23 @@ import { FixedPointMath } from "./libraries/FixedPointMath.sol";
 contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgradeable, ReentrancyGuard {
     using EnumerableSet for EnumerableSet.AddressSet;
 
-    error OnlyOrderBook();
     error OnlyLiquidationEngine();
     error NoPosition();
     error InsufficientBalance();
+    error StaleBatchNonce();
+
+    bytes32 public constant SETTLEMENT_ROLE = keccak256("SETTLEMENT_ROLE");
 
     IVault public vault;
     IMarginEngine public marginEngine;
     IOracleAdapter public oracle;
-    address public orderBook;
     address public liquidationEngine;
 
     mapping(address => mapping(uint256 => Position)) internal _positions;
     mapping(uint256 => EnumerableSet.AddressSet) internal _positionHolders;
+    uint64 public lastAppliedBatchNonce;
 
-    uint256[50] private __gap;
-
-    modifier onlyOrderBook() {
-        if (msg.sender != orderBook) revert OnlyOrderBook();
-        _;
-    }
+    uint256[49] private __gap;
 
     modifier onlyLiquidationEngine() {
         if (msg.sender != liquidationEngine) revert OnlyLiquidationEngine();
@@ -48,8 +45,8 @@ contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgr
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
     }
 
-    function setOrderBook(address _orderBook) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        orderBook = _orderBook;
+    function grantSettlement(address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(SETTLEMENT_ROLE, account);
     }
 
     function setLiquidationEngine(address _liquidationEngine) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -58,10 +55,45 @@ contract PositionManager is IPositionManager, UUPSUpgradeable, AccessControlUpgr
 
     function updatePosition(address account, uint256 marketId, int256 sizeDelta, uint256 fillPrice, uint256 marginDelta)
         external
-        onlyOrderBook
+        onlyRole(SETTLEMENT_ROLE)
         nonReentrant
     {
         _updatePositionInternal(account, marketId, sizeDelta, fillPrice, marginDelta);
+    }
+
+    /// @notice Write position snapshots from a proved batch.
+    /// @dev spec §15.3 step 12, §15.3.1: position-state only. Vault buckets
+    ///      are mutated separately via Vault.applyBatchDelta BEFORE this call.
+    function applyBatchFills(uint64 batchNonce_, Fill[] calldata fills)
+        external
+        onlyRole(SETTLEMENT_ROLE)
+        nonReentrant
+    {
+        if (batchNonce_ <= lastAppliedBatchNonce) revert StaleBatchNonce();
+
+        for (uint256 i; i < fills.length; ++i) {
+            Fill calldata f = fills[i];
+            Position storage pos = _positions[f.account][f.marketId];
+
+            if (f.newSize == 0) {
+                emit PositionClosed(f.account, f.marketId, f.realizedPnl);
+                delete _positions[f.account][f.marketId];
+                _positionHolders[f.marketId].remove(f.account);
+            } else {
+                bool wasEmpty = pos.size == 0;
+                pos.size = f.newSize;
+                pos.entryPrice = f.newEntryPrice;
+                pos.collateral = f.newCollateral;
+                pos.lastCumulativeFunding = f.newCumulativeFunding;
+                pos.lastUpdated = block.timestamp;
+
+                if (wasEmpty) _positionHolders[f.marketId].add(f.account);
+
+                emit PositionUpdated(f.account, f.marketId, f.newSize, f.newEntryPrice, f.newCollateral, f.realizedPnl);
+            }
+        }
+
+        lastAppliedBatchNonce = batchNonce_;
     }
 
     function liquidatePosition(address account, uint256 marketId, int256 sizeDelta, uint256 liquidationPrice)

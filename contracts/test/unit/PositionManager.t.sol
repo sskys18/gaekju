@@ -21,7 +21,7 @@ contract PositionManagerTest is Test {
     MockPyth public mockPyth;
 
     address public admin = makeAddr("admin");
-    address public orderBook = makeAddr("orderBook");
+    address public settlement = makeAddr("settlement");
     address public liquidationEngine = makeAddr("liquidationEngine");
     address public alice = makeAddr("alice");
 
@@ -65,10 +65,10 @@ contract PositionManagerTest is Test {
         );
 
         vm.startPrank(admin);
-        vault.grantAuthorized(address(pm));
-        vault.grantAuthorized(address(engine));
-        vault.grantAuthorized(orderBook);
-        pm.setOrderBook(orderBook);
+        vault.grantSettlement(address(pm));
+        vault.grantSettlement(address(engine));
+        vault.grantSettlement(settlement);
+        pm.grantRole(pm.SETTLEMENT_ROLE(), settlement);
         pm.setLiquidationEngine(liquidationEngine);
 
         engine.setMarketConfig(
@@ -97,14 +97,14 @@ contract PositionManagerTest is Test {
         vault.deposit(100_000e6);
 
         // Lock order margin to cover all test cases (max single-fill margin = 1_240e18)
-        vm.prank(orderBook);
+        vm.prank(settlement);
         vault.lockOrderMargin(alice, 10_000e18);
     }
 
     // ─── New Position ───
 
     function test_newLongPosition() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 0.5e18, 60_000e18, 600e18);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -115,7 +115,7 @@ contract PositionManagerTest is Test {
     }
 
     function test_newShortPosition() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -0.5e18, 60_000e18, 600e18);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -125,7 +125,7 @@ contract PositionManagerTest is Test {
     }
 
     function test_newPosition_registersHolder() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 0.5e18, 60_000e18, 600e18);
 
         assertEq(pm.getPositionCount(MARKET_ID), 1);
@@ -136,14 +136,14 @@ contract PositionManagerTest is Test {
     // ─── Increase Position ───
 
     function test_increaseLong_weightedAvgEntry() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 0.5e18, 60_000e18, 600e18);
 
         // Lock more order margin for second fill
-        vm.prank(orderBook);
+        vm.prank(settlement);
         vault.lockOrderMargin(alice, 620e18);
 
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 0.5e18, 62_000e18, 620e18);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -154,13 +154,13 @@ contract PositionManagerTest is Test {
     }
 
     function test_increaseShort_weightedAvgEntry() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -0.5e18, 60_000e18, 600e18);
 
-        vm.prank(orderBook);
+        vm.prank(settlement);
         vault.lockOrderMargin(alice, 580e18);
 
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -0.5e18, 58_000e18, 580e18);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -173,13 +173,13 @@ contract PositionManagerTest is Test {
     // ─── Partial Close ───
 
     function test_partialCloseLong_profit() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 1e18, 60_000e18, 1_200e18);
 
         uint256 balanceBefore = vault.balances(alice);
 
         // Close half at $62,000 => PnL = (62000 - 60000) * 0.5 = 1000
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -0.5e18, 62_000e18, 0);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -193,13 +193,13 @@ contract PositionManagerTest is Test {
     }
 
     function test_partialCloseLong_loss() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 1e18, 60_000e18, 1_200e18);
 
         uint256 balanceBefore = vault.balances(alice);
 
         // Close half at $58,000 => PnL = (58000 - 60000) * 0.5 = -1000
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -0.5e18, 58_000e18, 0);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -214,13 +214,13 @@ contract PositionManagerTest is Test {
     }
 
     function test_partialCloseShort_profit() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -1e18, 60_000e18, 1_200e18);
 
         uint256 balanceBefore = vault.balances(alice);
 
         // Close half at $58,000 => PnL = (58000 - 60000) * (-0.5) = +1000
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 0.5e18, 58_000e18, 0);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -235,10 +235,10 @@ contract PositionManagerTest is Test {
     // ─── Full Close ───
 
     function test_fullCloseLong() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 1e18, 60_000e18, 1_200e18);
 
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -1e18, 62_000e18, 0);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -250,10 +250,10 @@ contract PositionManagerTest is Test {
     }
 
     function test_fullCloseShort() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -1e18, 60_000e18, 1_200e18);
 
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 1e18, 58_000e18, 0);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -264,11 +264,11 @@ contract PositionManagerTest is Test {
     // ─── Flip ───
 
     function test_flipLongToShort() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 1e18, 60_000e18, 1_200e18);
 
         // Flip: sell 1.5 => close 1 long + open 0.5 short
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -1.5e18, 62_000e18, 0);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -282,10 +282,10 @@ contract PositionManagerTest is Test {
     }
 
     function test_flipShortToLong() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -1e18, 60_000e18, 1_200e18);
 
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 1.5e18, 58_000e18, 0);
 
         IPositionManager.Position memory pos = pm.getPosition(alice, MARKET_ID);
@@ -298,7 +298,7 @@ contract PositionManagerTest is Test {
     // ─── Unrealized PnL ───
 
     function test_unrealizedPnl_long_profit() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 1e18, 60_000e18, 1_200e18);
 
         // Mark price from oracle = $60,000 (set in setUp)
@@ -308,7 +308,7 @@ contract PositionManagerTest is Test {
     }
 
     function test_unrealizedPnl_short_profit() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, -1e18, 62_000e18, 1_240e18);
 
         // Mark price ~ $60,000
@@ -325,7 +325,7 @@ contract PositionManagerTest is Test {
     }
 
     function test_marginRatio_healthyPosition() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 1e18, 60_000e18, 1_200e18);
 
         uint256 ratio = pm.getMarginRatio(alice, MARKET_ID);
@@ -336,14 +336,14 @@ contract PositionManagerTest is Test {
 
     // ─── Access Control ───
 
-    function test_updatePosition_onlyOrderBook() public {
+    function test_updatePosition_onlySettlement() public {
         vm.expectRevert();
         vm.prank(alice);
         pm.updatePosition(alice, MARKET_ID, 0.5e18, 60_000e18, 600e18);
     }
 
     function test_liquidatePosition_onlyLiquidationEngine() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 1e18, 60_000e18, 1_200e18);
 
         vm.expectRevert();
@@ -354,17 +354,17 @@ contract PositionManagerTest is Test {
     // ─── Events ───
 
     function test_emitsPositionUpdated() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         vm.expectEmit(true, true, false, true);
         emit IPositionManager.PositionUpdated(alice, MARKET_ID, 0.5e18, 60_000e18, 600e18, 0);
         pm.updatePosition(alice, MARKET_ID, 0.5e18, 60_000e18, 600e18);
     }
 
     function test_emitsPositionClosed() public {
-        vm.prank(orderBook);
+        vm.prank(settlement);
         pm.updatePosition(alice, MARKET_ID, 1e18, 60_000e18, 1_200e18);
 
-        vm.prank(orderBook);
+        vm.prank(settlement);
         vm.expectEmit(true, true, false, false);
         emit IPositionManager.PositionClosed(alice, MARKET_ID, 0);
         pm.updatePosition(alice, MARKET_ID, -1e18, 60_000e18, 0);

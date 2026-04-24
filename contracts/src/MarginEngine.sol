@@ -7,7 +7,6 @@ import { IMarginEngine } from "./interfaces/IMarginEngine.sol";
 import { IVault } from "./interfaces/IVault.sol";
 import { IOracleAdapter } from "./interfaces/IOracleAdapter.sol";
 import { FixedPointMath } from "./libraries/FixedPointMath.sol";
-import { TickMath } from "./libraries/TickMath.sol";
 
 contract MarginEngine is IMarginEngine, UUPSUpgradeable, AccessControlUpgradeable {
     error OrderTooSmall();
@@ -87,7 +86,7 @@ contract MarginEngine is IMarginEngine, UUPSUpgradeable, AccessControlUpgradeabl
         if (c.maxLeverage == 0) revert MarketNotConfigured();
         if (size < c.minOrderSize) revert OrderTooSmall();
         if (size > c.maxOrderSize) revert OrderTooLarge();
-        if (!TickMath.isAligned(price, c.tickSize)) revert PriceNotAligned();
+        if (c.tickSize != 0 && price % c.tickSize != 0) revert PriceNotAligned();
     }
 
     function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) { }

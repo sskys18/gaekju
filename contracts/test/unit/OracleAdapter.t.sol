@@ -65,14 +65,4 @@ contract OracleAdapterTest is Test {
         vm.expectRevert();
         oracle.getIndexPrice(MARKET_BTC);
     }
-
-    function test_setOrderBook() public {
-        address mockOB = makeAddr("orderbook");
-        vm.prank(admin);
-        oracle.setOrderBook(MARKET_BTC, mockOB);
-        // After setting orderbook, getMarkPrice should blend (but mock OB returns 0 for best bid/ask)
-        // With zero mid-price, mark price falls back to oracle only
-        uint256 price = oracle.getMarkPrice(MARKET_BTC);
-        assertEq(price, 60_000e18);
-    }
 }

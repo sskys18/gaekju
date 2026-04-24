@@ -48,7 +48,7 @@ contract MarginEngineTest is Test {
         );
 
         vm.prank(admin);
-        vault.grantAuthorized(address(engine));
+        vault.grantSettlement(address(engine));
 
         vm.prank(admin);
         engine.setMarketConfig(
